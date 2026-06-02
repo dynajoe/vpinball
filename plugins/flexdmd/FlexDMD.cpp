@@ -130,17 +130,23 @@ void FlexDMD::SetRenderMode(RenderMode renderMode)
    AdvertiseDisplay();
 }
 
+// Thread safe per the display source contract: only returns the snapshot published on the
+// main thread by the plugin's OnPrepareFrame handler, never renders or touches the
+// scene/surface off the main thread. Rendering here on the caller's thread (dmdutil worker,
+// scoreview) raced the main thread mutating the same scene graph — SDL blit of a freed
+// glyph, black-frame flicker, and the 2026-07-31 double-fault in plugin-flexdmd.so.
 DisplayFrame FlexDMD::GetRenderFrame(void* callContext)
 {
    auto ctx = static_cast<CallContext*>(callContext);
    FlexDMD* me = ctx->me;
-   // Request the render thread to render a frame, and serve the latest rendered one
-   {
-      std::lock_guard requestLock(me->m_requestMutex);
-      me->m_renderRequested = true;
-   }
-   me->m_requestCond.notify_one();
-   return { me->m_frameId, ctx->renderFrame };
+   // Cab behaviour preserved across the 2026-10-03 rebase: upstream fb0531451 fixes the same
+   // crash with an on-request render thread serving a single stable buffer (readable mid-write,
+   // so a consumer can see a torn frame). We keep the cab-proven model instead: the scene is
+   // rendered once per VPX frame on the main thread (OnPrepareFrame -> RenderAndPublish) and
+   // published as a double-buffered snapshot; this just returns it, so upstream's render thread
+   // stays idle (it only renders when GetRenderFrame requests).
+   const RenderSnapshot snap = me->GetRenderSnapshot();
+   return { snap.frameId, snap.frame };
 }
 
 SegDisplayFrame FlexDMD::GetSegState(void* callContext)
@@ -539,17 +545,65 @@ void FlexDMD::UpdateRGBAFrame()
 const std::vector<uint32_t>& FlexDMD::GetDmdColoredPixels()
 {
    std::lock_guard renderLock(m_renderMutex);
+   const unsigned int before = m_frameId;
    Render();
    UpdateRGBAFrame();
+   if (m_frameId != before) // keep the cross-thread snapshot in sync with this main-thread render
+      PublishFrame();
    return m_rgbaFrame;
 }
 
 const std::vector<uint8_t>& FlexDMD::GetDmdPixels()
 {
    std::lock_guard renderLock(m_renderMutex);
+   const unsigned int before = m_frameId;
    Render();
    UpdateLumFrame();
+   if (m_frameId != before)
+      PublishFrame();
    return m_lumFrame;
+}
+
+void FlexDMD::RenderAndPublish()
+{
+   // m_renderMutex: on upstream's post-fb0531451 structure the scene/surface are guarded by
+   // this (recursive) mutex — script mutations hold it via LockRenderThread, and the render
+   // thread's single startup render try-locks it. Main-thread rendering must take it too.
+   std::lock_guard renderLock(m_renderMutex);
+   const unsigned int before = m_frameId;
+   Render();
+   if (m_frameId != before) // Render() is gated, only publish when it produced a new frame
+      PublishFrame();
+}
+
+void FlexDMD::PublishFrame()
+{
+   const int back = 1 - m_pubIndex.load(std::memory_order_relaxed);
+   std::vector<uint8_t>& buf = m_pubFrame[back];
+   if (m_renderMode == RenderMode_DMD_RGB)
+   {
+      const uint8_t* const __restrict src = UpdateRGBFrame();
+      buf.assign(src, src + static_cast<size_t>(m_width) * m_height * 3);
+   }
+   else if ((m_renderMode == RenderMode_DMD_GRAY_2) || (m_renderMode == RenderMode_DMD_GRAY_4))
+   {
+      const float* const __restrict src = UpdateLumFP32Frame();
+      const size_t bytes = static_cast<size_t>(m_width) * m_height * sizeof(float);
+      buf.resize(bytes);
+      memcpy(buf.data(), src, bytes);
+   }
+   else
+      return; // segment modes have no render frame
+   m_pubFrameId[back] = m_frameId;
+   m_pubIndex.store(back, std::memory_order_release);
+}
+
+FlexDMD::RenderSnapshot FlexDMD::GetRenderSnapshot() const
+{
+   const int idx = m_pubIndex.load(std::memory_order_acquire);
+   if (m_pubFrame[idx].empty())
+      return { 0, nullptr };
+   return { m_pubFrameId[idx], m_pubFrame[idx].data() };
 }
 
 void FlexDMD::SetSegments(const std::vector<uint16_t>& segments)
