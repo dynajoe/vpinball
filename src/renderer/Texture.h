@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "unordered_dense.h"
 
 #include "math/math.h"
@@ -143,6 +145,8 @@ private:
    mutable std::mutex m_lazyMutex; // Taken after m_aliasMutex
    mutable std::atomic<bool> m_isOpaqueDirty { true };
    mutable std::atomic<bool> m_isOpaque { true };
+   // The alias cache is read on the DMD consumer thread (e.g. dmdutil worker via GetAlias) while the
+   // owning thread rewrites the texture and clears it, so all m_aliases access must be serialized.
    mutable std::mutex m_aliasMutex;
    mutable ankerl::unordered_dense::map<Format, std::shared_ptr<BaseTexture>> m_aliases;
 };
