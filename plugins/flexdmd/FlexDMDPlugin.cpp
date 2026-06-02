@@ -319,6 +319,19 @@ static VPXPluginAPI* vpxApi = nullptr;
 static ScriptablePluginAPI* scriptApi = nullptr;
 static uint32_t endpointId, nextDmdId;
 static std::vector<FlexDMD*> flexDmds;
+static unsigned int onPrepareFrameId;
+
+// Render the shown DMDs once per frame on the main render thread and publish their snapshot,
+// so that GetRenderFrame consumers (scoreview on the main thread, dmdutil on its worker
+// thread) never drive rendering off the main thread.
+static void OnPrepareFrame(const unsigned int eventId, void* userData, void* msgData)
+{
+   for (FlexDMD* pFlex : flexDmds)
+   {
+      if (pFlex->GetShow() && ((pFlex->GetRenderMode() == RenderMode_DMD_GRAY_2) || (pFlex->GetRenderMode() == RenderMode_DMD_GRAY_4) || (pFlex->GetRenderMode() == RenderMode_DMD_RGB)))
+         pFlex->RenderAndPublish();
+   }
+}
 
 PSC_ERROR_IMPLEMENT(scriptApi); // Implement script error
 
@@ -335,6 +348,9 @@ MSGPI_EXPORT void MSGPIAPI FlexDMDPluginLoad(const uint32_t sessionId, const Msg
 
    // Setup login
    LPISetup(endpointId, msgApi);
+
+   onPrepareFrameId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_EVT_ON_PREPARE_FRAME);
+   msgApi->SubscribeMsg(endpointId, onPrepareFrameId, OnPrepareFrame, nullptr);
 
    unsigned int getVpxApiId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_MSG_GET_API);
    msgApi->BroadcastMsg(endpointId, getVpxApiId, &vpxApi);
@@ -411,6 +427,9 @@ MSGPI_EXPORT void MSGPIAPI FlexDMDPluginLoad(const uint32_t sessionId, const Msg
 
 MSGPI_EXPORT void MSGPIAPI FlexDMDPluginUnload()
 {
+   msgApi->UnsubscribeMsg(onPrepareFrameId, OnPrepareFrame, nullptr);
+   msgApi->ReleaseMsgID(onPrepareFrameId);
+
    auto regLambda = [&](ScriptClassDef* scd) { scriptApi->UnregisterScriptClass(scd); };
    auto aliasLambda = [&](const char* name) { scriptApi->UnregisterScriptTypeAlias(name); };
    auto arrayLambda = [&](ScriptArrayDef* sad) { scriptApi->UnregisterScriptArrayType(sad); };

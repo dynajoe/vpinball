@@ -119,17 +119,17 @@ void FlexDMD::SetRenderMode(RenderMode renderMode)
    AdvertiseDisplay();
 }
 
+// Thread safe per the display source contract: only returns the snapshot published on the
+// main thread by the plugin's OnPrepareFrame handler, never renders or touches the
+// scene/surface off the main thread. Rendering here on the caller's thread (dmdutil worker,
+// scoreview) raced the main thread mutating the same scene graph — SDL blit of a freed
+// glyph, black-frame flicker, and the 2026-07-31 double-fault in plugin-flexdmd.so.
 DisplayFrame FlexDMD::GetRenderFrame(void* callContext)
 {
    auto ctx = static_cast<CallContext*>(callContext);
    FlexDMD* me = ctx->me;
-   me->Render();
-   if (me->GetRenderMode() == RenderMode_DMD_RGB)
-      return { me->m_frameId, me->UpdateRGBFrame() };
-   else if ((me->GetRenderMode() == RenderMode_DMD_GRAY_2) || (me->GetRenderMode() == RenderMode_DMD_GRAY_4))
-      return { me->m_frameId, me->UpdateLumFP32Frame() };
-   assert(false);
-   return { 0, nullptr };
+   const RenderSnapshot snap = me->GetRenderSnapshot();
+   return { snap.frameId, snap.frame };
 }
 
 SegDisplayFrame FlexDMD::GetSegState(void* callContext)
@@ -459,16 +459,60 @@ void FlexDMD::UpdateRGBAFrame()
 
 const std::vector<uint32_t>& FlexDMD::GetDmdColoredPixels()
 {
+   const unsigned int before = m_frameId;
    Render();
    UpdateRGBAFrame();
+   if (m_frameId != before) // keep the cross-thread snapshot in sync with this main-thread render
+      PublishFrame();
    return m_rgbaFrame;
 }
 
 const std::vector<uint8_t>& FlexDMD::GetDmdPixels()
 {
+   const unsigned int before = m_frameId;
    Render();
    UpdateLumFrame();
+   if (m_frameId != before)
+      PublishFrame();
    return m_lumFrame;
+}
+
+void FlexDMD::RenderAndPublish()
+{
+   const unsigned int before = m_frameId;
+   Render();
+   if (m_frameId != before) // Render() is gated, only publish when it produced a new frame
+      PublishFrame();
+}
+
+void FlexDMD::PublishFrame()
+{
+   const int back = 1 - m_pubIndex.load(std::memory_order_relaxed);
+   std::vector<uint8_t>& buf = m_pubFrame[back];
+   if (m_renderMode == RenderMode_DMD_RGB)
+   {
+      const uint8_t* const __restrict src = UpdateRGBFrame();
+      buf.assign(src, src + static_cast<size_t>(m_width) * m_height * 3);
+   }
+   else if ((m_renderMode == RenderMode_DMD_GRAY_2) || (m_renderMode == RenderMode_DMD_GRAY_4))
+   {
+      const float* const __restrict src = UpdateLumFP32Frame();
+      const size_t bytes = static_cast<size_t>(m_width) * m_height * sizeof(float);
+      buf.resize(bytes);
+      memcpy(buf.data(), src, bytes);
+   }
+   else
+      return; // segment modes have no render frame
+   m_pubFrameId[back] = m_frameId;
+   m_pubIndex.store(back, std::memory_order_release);
+}
+
+FlexDMD::RenderSnapshot FlexDMD::GetRenderSnapshot() const
+{
+   const int idx = m_pubIndex.load(std::memory_order_acquire);
+   if (m_pubFrame[idx].empty())
+      return { 0, nullptr };
+   return { m_pubFrameId[idx], m_pubFrame[idx].data() };
 }
 
 void FlexDMD::SetSegments(const std::vector<uint16_t>& segments)
