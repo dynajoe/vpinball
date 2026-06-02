@@ -546,6 +546,7 @@ void VPXPluginAPIImpl::UpdateSetting(const std::string& pluginId, MsgPI::MsgPlug
 void VPXPluginAPIImpl::OnGameStart()
 {
    assert(m_dmdSources.empty());
+   m_globalDmdSrc = {};
    const auto& msgApi = m_msgApi;
 
    msgApi.SubscribeMsg(GetVPXEndPointId(), m_onDisplayGetSrcMsgId, &ControllerOnGetDMDSrc, this);
@@ -589,6 +590,7 @@ void VPXPluginAPIImpl::OnGameEnd()
    msgApi.UnsubscribeMsg(m_onDisplayGetSrcMsgId, &ControllerOnGetDMDSrc, this);
 
    m_dmdSources.clear();
+   m_globalDmdSrc = {};
 
    msgApi.BroadcastMsg(GetVPXEndPointId(), m_onDisplaySrcChgMsgId, nullptr);
 
@@ -613,6 +615,19 @@ void VPXPluginAPIImpl::UpdateDMDSource(Flasher* flasher, bool isAdd)
             return;
          RemoveFromVectorSingle(m_dmdSources, flasher);
       }
+   }
+   else
+   {
+      // Global script DMD: DMDPixels/DMDColoredPixels call this on every frame, but only the
+      // content changes, not the source set. Only broadcast when the descriptor actually changes
+      // (first appearance, or a size/format change), otherwise consumers re-scan/reset every frame.
+      const decltype(m_globalDmdSrc) cur = (g_pplayer && g_pplayer->m_dmdFrame)
+         ? decltype(m_globalDmdSrc){ true, g_pplayer->m_dmdFrame->width(), g_pplayer->m_dmdFrame->height(), g_pplayer->m_dmdFrame->m_format }
+         : decltype(m_globalDmdSrc){};
+      if (cur.present == m_globalDmdSrc.present && cur.width == m_globalDmdSrc.width
+         && cur.height == m_globalDmdSrc.height && cur.format == m_globalDmdSrc.format)
+         return;
+      m_globalDmdSrc = cur;
    }
 
    const auto& msgApi = m_msgApi;
