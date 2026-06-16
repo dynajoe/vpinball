@@ -311,6 +311,7 @@ private:
    bool m_dirty = true;
    std::unique_ptr<Animation> m_animation;
    RenderState m_renderState;
+   SDL_Rect m_canonRect { 0, 0, 0, 0 }; // tallest output rect seen; text is prerendered for this rect and scaled down per output
    int m_animationFrame = 0;
    uint64_t m_animationStart = 0;
    std::future<RenderState> m_pendingTextureUpdate;
