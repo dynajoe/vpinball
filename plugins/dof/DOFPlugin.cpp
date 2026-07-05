@@ -199,6 +199,14 @@ static void OnControllerGameStart(const unsigned int eventId, void* userData, vo
    const CtlOnGameStartMsg* msg = static_cast<const CtlOnGameStartMsg*>(msgData);
    assert(msg != nullptr && msg->gameId != nullptr);
 
+   // Early B2S broadcasts can fire with an empty gameId before the ROM name is
+   // committed; ignore them so DOF waits for the real name (matches PUPPlugin).
+   if (msg->gameId[0] == '\0')
+   {
+      LOGI("Ignoring game start with empty gameId (waiting for committed ROM name)"s);
+      return;
+   }
+
    // FIXME: Temp fix for issues 3298, 3309, and maybe 3322?
    if (isRunning)
    {
