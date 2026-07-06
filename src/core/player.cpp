@@ -2305,6 +2305,7 @@ void Player::OnAuxRendererChanged(const unsigned int msgId, void* userData, void
 {
    Player * const me = static_cast<Player *>(userData);
    const MsgPluginAPI *m_msgApi = &me->m_pluginManager.GetMsgAPI();
+   std::scoped_lock ancillaryLock(me->m_ancillaryWndRenderersMutex);
    for (int i = 0; i <= VPXWindowId::VPXWINDOW_Topper; i++)
    {
       const VPXWindowId window = (VPXWindowId) i;

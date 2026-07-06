@@ -3,6 +3,7 @@
 #pragma once
 
 #ifndef __STANDALONE__
+#include <mutex>
 #include <wxx_stdcontrols.h> // Add CButton, CEdit, CListBox
 #endif
 
@@ -66,7 +67,7 @@ public:
    string GetPerfInfo();
 
    void SetPlayState(const bool isPlaying, const uint32_t delayBeforePauseMs = 0); // Allow to play/pause during UI interaction or to perform timed simulation steps (still needs the player window to be focused).
-   bool IsPlaying(const bool applyWndFocus = true) const { return (m_playMode == PlayMode::CaptureAttract) || (m_wantsToPlay && (applyWndFocus ? m_playfieldWnd->IsFocused() : true) && !IsEditorMode()); }
+   bool IsPlaying(const bool applyWndFocus = true) const { return !IsEditorMode(); } // LOCAL TEST HACK: always play (headless, ignore window focus)
    void OnFocusChanged(); // On focus lost, pause player and show mouse cursor
 
    uint32_t m_pauseTimeTarget = 0;
@@ -194,6 +195,7 @@ public:
    std::unique_ptr<Renderer> m_renderer;
    VRDevice *m_vrDevice = nullptr;
    vector<AncillaryRendererDef> m_ancillaryWndRenderers[VPXWindowId::VPXWINDOW_Topper + 1];
+   std::mutex m_ancillaryWndRenderersMutex; // guards m_ancillaryWndRenderers vs render thread while OnAuxRendererChanged resizes it
    int GetAncillaryRendererPriority(VPXWindowId window, const string& id) const;
    void SetAncillaryRendererPriority(VPXWindowId window, const string& id, int priority);
 

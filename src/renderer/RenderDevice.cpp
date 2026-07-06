@@ -2647,6 +2647,8 @@ void RenderDevice::Clear(const DWORD flags, const DWORD color)
 void RenderDevice::BlitRenderTarget(RenderTarget* source, RenderTarget* destination, bool copyColor, bool copyDepth, const int x1, const int y1, const int w1, const int h1, const int x2,
    const int y2, const int w2, const int h2, const int srcLayer, const int dstLayer)
 {
+   if (source == nullptr || destination == nullptr) // PUP/plugin screen mapped to a window absent in this display config yields a null RT; skip to avoid null deref in CopyTo (dest->GetWidth())
+      return;
    assert(m_currentPass->m_rt == destination); // We must be on a render pass targeted at the destination for correct render pass sorting
    AddRenderTargetDependency(source);
    RenderCommand* cmd = m_renderFrame->NewCommand();
