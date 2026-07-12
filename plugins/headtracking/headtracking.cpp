@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -36,9 +37,17 @@ static double            g_pose[6] = {0,0,0,0,0,0};
 static std::atomic<bool> g_haveBase{false};
 static float             g_baseX=0.f, g_baseY=0.f, g_baseZ=0.f;
 static long              g_frames = 0;
+static double            g_poseTime = 0.0;
+
+constexpr double HT_STALE_S = 1.0;   // no packet for this long => tracker is gone
 
 static float envF(const char* name, float dflt) { const char* v = getenv(name); return v ? (float)atof(v) : dflt; }
 static int   envI(const char* name, int   dflt) { const char* v = getenv(name); return v ? atoi(v) : dflt; }
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static double nowSec() {
+   timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+   return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+}
 
 static void udpListener() {
    int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -54,7 +63,7 @@ static void udpListener() {
    while (g_running.load()) {
       ssize_t n = recv(s, buf, sizeof(buf), 0);
       if (n == (ssize_t)sizeof(buf)) {
-         { std::lock_guard<std::mutex> lk(g_poseMtx); memcpy(g_pose, buf, sizeof(buf)); }
+         { std::lock_guard<std::mutex> lk(g_poseMtx); memcpy(g_pose, buf, sizeof(buf)); g_poseTime = nowSec(); }
          if ((rx++ % 60) == 0) { fprintf(stderr, "HEADTRACK: rx #%ld x=%.1f y=%.1f z=%.1f\n", rx, buf[0], buf[1], buf[2]); fflush(stderr); }
       }
    }
@@ -62,7 +71,7 @@ static void udpListener() {
 }
 
 void onGameStart(const unsigned int, void*, void*) {
-   g_haveBase.store(false); g_frames = 0;
+   g_haveBase.store(false); g_frames = 0; g_poseTime = 0.0;
    if (!g_running.exchange(true)) g_udpThread = std::thread(udpListener);
    if (vpxApi) vpxApi->PushNotification("Head tracking active", 3000);
 }
@@ -76,13 +85,37 @@ void onPrepareFrame(const unsigned int, void*, void*) {
       g_baseX = view.viewX; g_baseY = view.viewY; g_baseZ = view.viewZ;
       fprintf(stderr, "HEADTRACK: base eye=(%.2f,%.2f,%.2f) viewMode=%d\n", g_baseX, g_baseY, g_baseZ, view.viewMode); fflush(stderr);
    }
-   double p[6]; { std::lock_guard<std::mutex> lk(g_poseMtx); memcpy(p, g_pose, sizeof(p)); }
-   view.viewX = g_baseX + (float)p[0]*envF("HT_SCALE_X", 1.0f);
-   view.viewY = g_baseY + (float)p[1]*envF("HT_SCALE_Y", 1.0f);
-   view.viewZ = g_baseZ + (float)p[2]*envF("HT_SCALE_Z", 1.0f);
+   double p[6]; double age;
+   { std::lock_guard<std::mutex> lk(g_poseMtx); memcpy(p, g_pose, sizeof(p)); age = nowSec() - g_poseTime; }
+
+   // Stale pose = no tracker. Fall back to the neutral eye rather than freezing the
+   // view at whatever offset it happened to die on.
+   if (age > HT_STALE_S) { p[0] = p[1] = p[2] = 0.0; }
+
+   // AXES. The tracker speaks opentrack: x=lateral, y=UP, z=DEPTH.
+   // VPX does NOT: in ViewSetup, Y is DEPTH and Z is HEIGHT (the cab settings say so
+   // outright — ScreenPlayerY is "toward the player", ScreenPlayerZ is "up"). Mapping
+   // y->viewY and z->viewZ, as this plugin originally did, therefore dollies the camera
+   // when you nod and slides it vertically when you lean in. Swap them.
+   //
+   // Signs, MEASURED, not reasoned. I first argued that the Kinect faces the player so
+   // its +x must be the player's left, and defaulted X to -1. Then I logged an actual
+   // human leaning: left gives x=-19, right gives x=+20. It is NOT mirrored. Depth IS
+   // inverted (leaning in drops z 107->92cm, and "in" means further INTO the table,
+   // i.e. VPX +Y). Trust the trace over the geometry argument.
+   const float x = (float)p[0] * envF("HT_SCALE_X", 1.0f) * envF("HT_SIGN_X", 1.0f);
+   const float up = (float)p[1] * envF("HT_SCALE_Y", 1.0f) * envF("HT_SIGN_Y", 1.0f);
+   const float depth = (float)p[2] * envF("HT_SCALE_Z", 1.0f) * envF("HT_SIGN_Z", -1.0f);
+
+   // Clamp: one bad depth sample must not hurl the camera across the room.
+   const float lim = envF("HT_LIMIT_VPU", 700.0f);   // ~38cm at 18.5 VPU/cm
+   view.viewX = g_baseX + clampf(x, -lim, lim);
+   view.viewY = g_baseY + clampf(depth, -lim, lim);   // VPX Y = depth  <- tracker z
+   view.viewZ = g_baseZ + clampf(up, -lim, lim);      // VPX Z = height <- tracker y
    vpxApi->SetActiveViewSetup(&view);
    if ((g_frames++ % 60) == 0) {
-      fprintf(stderr, "HEADTRACK: frame %ld pose(x=%.1f y=%.1f z=%.1f) -> eye(%.2f,%.2f,%.2f)\n", g_frames, p[0], p[1], p[2], view.viewX, view.viewY, view.viewZ); fflush(stderr);
+      fprintf(stderr, "HEADTRACK: frame %ld pose(x=%.1f up=%.1f depth=%.1f age=%.1fs) -> eye(%.2f,%.2f,%.2f)\n",
+              g_frames, p[0], p[1], p[2], age, view.viewX, view.viewY, view.viewZ); fflush(stderr);
    }
 }
 
