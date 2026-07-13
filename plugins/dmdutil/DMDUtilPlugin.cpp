@@ -129,6 +129,16 @@ private:
    void ProcessFrame(const DisplaySrcId& dmdSource)
    {
       const DisplayFrame frame = dmdSource.GetRenderFrame(dmdSource.callContext);
+
+      // The frame DATA can be null even when the source is otherwise valid: no frame has
+      // been produced yet, or the source was torn down between the selection above and this
+      // call. Every branch below dereferences frame.frame immediately, so without this
+      // the thread reads through a null pointer and takes the whole player down with it.
+      // Do NOT mark the frame as seen — the same frameId may arrive again with real data.
+      // (Cab evidence: six identical segfaults at 0 in plugin-dmdutil.so, LUM32F load.)
+      if (frame.frame == nullptr)
+         return;
+
       if (m_lastFrameID == frame.frameId)
          return;
       m_lastFrameID = frame.frameId;
