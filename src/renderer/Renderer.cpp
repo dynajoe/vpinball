@@ -64,6 +64,7 @@ Renderer::Renderer(PinTable* const table, VPX::Window* wnd, VideoSyncMode& syncM
    m_sharpen = m_table->m_settings.GetPlayer_Sharpen();
    m_ss_refl = m_table->m_settings.GetPlayer_SSRefl();
    m_bloomOff = m_table->m_settings.GetPlayer_ForceBloomOff();
+   m_bloomStrengthScale = m_table->m_settings.GetPlayer_BloomStrengthScale();
    m_motionBlurOff = m_table->m_settings.GetPlayer_ForceMotionBlurOff();
    m_maxReflectionMode = (RenderProbe::ReflectionMode)m_table->m_settings.GetPlayer_PFReflection();
    m_trailForBalls = m_table->m_settings.GetPlayer_BallTrail();
@@ -2089,7 +2090,8 @@ void Renderer::UpdateAmbientOcclusion(RenderTarget* renderedRT)
 
 bool Renderer::IsBloomEnabled() const
 {
-   return !m_bloomOff && (m_table->m_bloom_strength > 0.0f) && (g_pplayer->GetInfoMode() <= IF_DYNAMIC_ONLY);
+   return !m_bloomOff && (m_table->m_bloom_strength * m_bloomStrengthScale > 0.0f)
+       && (g_pplayer->GetInfoMode() <= IF_DYNAMIC_ONLY);
 }
 
 void Renderer::UpdateBloom(RenderTarget* renderedRT)
@@ -2120,7 +2122,7 @@ void Renderer::UpdateBloom(RenderTarget* renderedRT)
       m_renderDevice->AddRenderTargetDependency(renderedRT);
 
       m_renderDevice->m_FBShader->SetTexture(ShaderUniform::tex_fb_filtered, renderedRT->GetColorSampler());
-      m_renderDevice->m_FBShader->SetVector(ShaderUniform::w_h_height, (float) (1.0 / w), (float) (1.0 / h), m_table->m_bloom_strength, 1.0f);
+      m_renderDevice->m_FBShader->SetVector(ShaderUniform::w_h_height, (float) (1.0 / w), (float) (1.0 / h), m_table->m_bloom_strength * m_bloomStrengthScale, 1.0f);
       m_renderDevice->m_FBShader->SetTechnique(ShaderTechnique::fb_bloom);
 
       m_renderDevice->DrawTexturedQuad(m_renderDevice->m_FBShader, shiftedVerts);
