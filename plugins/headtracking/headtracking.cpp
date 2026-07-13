@@ -112,9 +112,19 @@ static void udpListener() {
 void onGameStart(const unsigned int, void*, void*) {
    g_haveBase.store(false); g_frames = 0; g_poseTime = 0.0;
    if (!g_running.exchange(true)) g_udpThread = std::thread(udpListener);
-   if (vpxApi) vpxApi->PushNotification("Head tracking active", 3000);
+   if (vpxApi) {
+      // MANDATORY when moving the eye. The static prepass is a baked image of the table's
+      // static parts rendered ONCE from the camera as it was; the dynamic parts are then
+      // composited over it every frame from the CURRENT camera. Move the camera per frame
+      // and the two disagree — the playfield visibly separates from the objects sitting on
+      // it and flashes, on every table. VPX's own point-of-view page does exactly this for
+      // as long as its camera is being dragged.
+      vpxApi->DisableStaticPrerendering(1);
+      vpxApi->PushNotification("Head tracking active", 3000);
+   }
 }
 void onGameEnd(const unsigned int, void*, void*) {
+   if (vpxApi) vpxApi->DisableStaticPrerendering(0);   // refcounted — give it back
    if (g_running.exchange(false)) { if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR); if (g_udpThread.joinable()) g_udpThread.join(); }
 }
 void onPrepareFrame(const unsigned int, void*, void*) {
