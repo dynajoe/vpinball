@@ -118,6 +118,15 @@ static void UpdateThread()
          continue;
 
       const DisplayFrame frame = selectedDmdId.GetRenderFrame(selectedDmdId.id);
+
+      // The frame DATA can be null even when the source is otherwise valid: no frame has
+      // been produced yet, or the source was torn down between the guard above and this
+      // call. Every branch below dereferences frame.frame immediately, so without this
+      // the thread reads through a null pointer and takes the whole player down with it.
+      // Do NOT mark the frame as seen — the same frameId may arrive again with real data.
+      if (frame.frame == nullptr)
+         continue;
+
       if (lastFrameID == frame.frameId)
          continue;
       lastFrameID = frame.frameId;
