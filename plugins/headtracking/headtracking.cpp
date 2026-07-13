@@ -40,6 +40,8 @@ static double            g_pose[6] = {0,0,0,0,0,0};
 static std::atomic<bool> g_haveBase{false};
 static float             g_baseX=0.f, g_baseY=0.f, g_baseZ=0.f;
 static float             g_tableLength = 2000.f;   // VPU; captured with the base
+static float             g_rotSign = 0.f;           // 0 = unproven; ±1 once self-tested
+static float             g_zOffset = 0.f;           // wbot*sceneScaleY/realToVirtual, captured
 static long              g_frames = 0;
 static double            g_poseTime = 0.0;
 
@@ -137,9 +139,39 @@ void onPrepareFrame(const unsigned int, void*, void*) {
       VPXTableInfo ti{};
       vpxApi->GetTableInfo(&ti);
       if (ti.tableHeight > 1.0f) g_tableLength = ti.tableHeight;   // m_bottom, VPU
-      fprintf(stderr, "HEADTRACK: base eye=(%.2f,%.2f,%.2f) mode=%d tableLen=%.0f wTop=%.1f wBot=%.1f incl=%.1f\n",
-              g_baseX, g_baseY, g_baseZ, view.viewMode, g_tableLength,
-              view.windowTopZOfs, view.windowBottomZOfs, view.screenInclination); fflush(stderr);
+
+      // SELF-PROOF of the rotation convention. The launcher exports HT_ANCHOR as the ini
+      // ScreenPlayerX,Y,Z (cm). VPX has ALREADY transformed exactly those numbers into
+      // the base view we just read — so transform them ourselves with both matrix
+      // conventions and keep the one that reproduces VPX's own answer. No human has to
+      // lean to settle a sign bit ever again.
+      const char* anch = getenv("HT_ANCHOR");
+      float ax=0, ay=0, az=0;
+      if (anch && sscanf(anch, "%f,%f,%f", &ax, &ay, &az) == 3) {
+         const float CMTOVPU = 50.0f / (2.54f * 1.0625f);
+         const float rad = (float)M_PI / 180.0f;
+         const float ang = atan2f(view.windowTopZOfs - view.windowBottomZOfs, g_tableLength)
+                         - view.screenInclination * rad;
+         const float c = cosf(ang), sn = sinf(ang);
+         const float Y = ay * CMTOVPU, Z = az * CMTOVPU;
+         // solve the z offset from the base too (it also verifies wbot*scale/r2v)
+         for (float sign : {1.0f, -1.0f}) {
+            const float vy = Y * c - Z * sn * sign;
+            const float vz = Y * sn * sign + Z * c;
+            if (fabsf(vy - g_baseY) < 2.0f) {   // Y has no offset term — clean discriminator
+               g_rotSign = sign;
+               g_zOffset = g_baseZ - vz;
+               break;
+            }
+         }
+      }
+      if (g_rotSign != 0.f)
+         fprintf(stderr, "HEADTRACK: rotation convention PROVEN sign=%+.0f zOffset=%.1f (base %.1f,%.1f,%.1f)\n",
+                 g_rotSign, g_zOffset, g_baseX, g_baseY, g_baseZ);
+      else
+         fprintf(stderr, "HEADTRACK: convention NOT proven (HT_ANCHOR=%s base=%.1f,%.1f,%.1f) — absolute mode disabled\n",
+                 anch ? anch : "unset", g_baseX, g_baseY, g_baseZ);
+      fflush(stderr);
    }
    double p[6]; double age;
    { std::lock_guard<std::mutex> lk(g_poseMtx); memcpy(p, g_pose, sizeof(p)); age = nowSec() - g_poseTime; }
@@ -160,6 +192,30 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    // inverted (leaning in drops z 107->92cm, and "in" means further INTO the table,
    // i.e. VPX +Y). Trust the trace over the geometry argument.
    if ((g_frames % 20) == 0) reloadTune();     // pick up a live gain change
+
+   // ABSOLUTE mode (tracker calibrated to the screen): p[0..2] is the eye in VPX player
+   // space (cm), flagged by p[3]~1000. Full SetViewPosFromPlayerPosition equivalent,
+   // using the convention and offset PROVEN against VPX itself at base capture.
+   if (p[3] > 900.0 && g_rotSign != 0.f) {
+      const float CMTOVPU = 50.0f / (2.54f * 1.0625f);
+      const float rad = (float)M_PI / 180.0f;
+      const float ang = atan2f(view.windowTopZOfs - view.windowBottomZOfs, g_tableLength)
+                      - view.screenInclination * rad;
+      const float c = cosf(ang), sn = sinf(ang) * g_rotSign;
+      const float X = (float)p[0] * CMTOVPU;
+      const float Y = (float)p[1] * CMTOVPU;
+      const float Z = (float)p[2] * CMTOVPU;
+      view.viewX = X;
+      view.viewY = Y * c - Z * sn;
+      view.viewZ = Y * sn + Z * c + g_zOffset;
+      vpxApi->SetActiveViewSetup(&view);
+      if ((g_frames++ % 60) == 0) {
+         fprintf(stderr, "HEADTRACK: ABS eye(%.1f,%.1f,%.1f)cm -> view(%.1f,%.1f,%.1f)\n",
+                 p[0], p[1], p[2], view.viewX, view.viewY, view.viewZ); fflush(stderr);
+      }
+      return;
+   }
+
    const float g = g_gain;
 
    // Head delta in PLAYER-SPACE centimetres (the space ScreenPlayerX/Y/Z live in):
