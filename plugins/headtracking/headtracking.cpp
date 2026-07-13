@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <sys/stat.h>
+#include <string>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -42,6 +44,43 @@ static double            g_poseTime = 0.0;
 constexpr double HT_STALE_S = 1.0;   // no packet for this long => tracker is gone
 
 static float envF(const char* name, float dflt) { const char* v = getenv(name); return v ? (float)atof(v) : dflt; }
+
+// LIVE GAIN. 1:1 parallax (18.527 VPU/cm, i.e. the view moves exactly as the real
+// world would) is physically honest and, on a cab, wildly too much — Joe's words were
+// "way too much". Everyone runs this well under 1. Rather than bake a number in and
+// iterate through rebuilds, re-read a tuning file so the gain can be dialled WHILE A
+// TABLE IS RUNNING and settled by feel, which is the only way this is ever settled.
+//
+//   /userdata/system/.config/vpinfe/ht-tune.conf     gain = 0.35
+//
+// Checked by mtime a few times a second: no cost, and no restart to try a value.
+static float  g_gain = 1.0f;
+static time_t g_tuneMtime = 0;
+static const char* tune_path() {
+   static std::string p;
+   if (p.empty()) {
+      const char* home = getenv("HOME");
+      p = std::string(home ? home : "/userdata/system") + "/.config/vpinfe/ht-tune.conf";
+   }
+   return p.c_str();
+}
+static void reloadTune() {
+   struct stat st;
+   if (stat(tune_path(), &st) != 0) return;
+   if (st.st_mtime == g_tuneMtime) return;
+   g_tuneMtime = st.st_mtime;
+   FILE* f = fopen(tune_path(), "r");
+   if (!f) return;
+   char line[128];
+   while (fgets(line, sizeof(line), f)) {
+      float v;
+      if (sscanf(line, " gain = %f", &v) == 1 || sscanf(line, " gain=%f", &v) == 1) {
+         g_gain = v;
+         fprintf(stderr, "HEADTRACK: gain -> %.3f\n", g_gain); fflush(stderr);
+      }
+   }
+   fclose(f);
+}
 static int   envI(const char* name, int   dflt) { const char* v = getenv(name); return v ? atoi(v) : dflt; }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static double nowSec() {
@@ -103,9 +142,11 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    // human leaning: left gives x=-19, right gives x=+20. It is NOT mirrored. Depth IS
    // inverted (leaning in drops z 107->92cm, and "in" means further INTO the table,
    // i.e. VPX +Y). Trust the trace over the geometry argument.
-   const float x = (float)p[0] * envF("HT_SCALE_X", 1.0f) * envF("HT_SIGN_X", 1.0f);
-   const float up = (float)p[1] * envF("HT_SCALE_Y", 1.0f) * envF("HT_SIGN_Y", 1.0f);
-   const float depth = (float)p[2] * envF("HT_SCALE_Z", 1.0f) * envF("HT_SIGN_Z", -1.0f);
+   if ((g_frames % 20) == 0) reloadTune();     // pick up a live gain change
+   const float g = g_gain;
+   const float x = (float)p[0] * envF("HT_SCALE_X", 1.0f) * envF("HT_SIGN_X", -1.0f) * g;
+   const float up = (float)p[1] * envF("HT_SCALE_Y", 1.0f) * envF("HT_SIGN_Y", 1.0f) * g;
+   const float depth = (float)p[2] * envF("HT_SCALE_Z", 1.0f) * envF("HT_SIGN_Z", -1.0f) * g;
 
    // Clamp: one bad depth sample must not hurl the camera across the room.
    const float lim = envF("HT_LIMIT_VPU", 700.0f);   // ~38cm at 18.5 VPU/cm
