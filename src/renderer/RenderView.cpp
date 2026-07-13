@@ -1248,7 +1248,7 @@ void RenderView::UpdateBloom(RenderTarget* renderedRT)
       rd->AddRenderTargetDependency(renderedRT);
 
       rd->m_FBShader->SetTexture(ShaderUniform::tex_fb_filtered, renderedRT->GetColorSampler());
-      rd->m_FBShader->SetVector(ShaderUniform::w_h_height, (float)(1.0 / w), (float)(1.0 / h), r->m_table->m_bloom_strength, 1.0f);
+      rd->m_FBShader->SetVector(ShaderUniform::w_h_height, (float)(1.0 / w), (float)(1.0 / h), r->m_table->m_bloom_strength * r->m_bloomStrengthScale, 1.0f);
       rd->m_FBShader->SetTechnique(ShaderTechnique::fb_bloom);
 
       rd->DrawTexturedQuad(rd->m_FBShader, shiftedVerts);

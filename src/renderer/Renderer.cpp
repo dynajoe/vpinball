@@ -1395,7 +1395,7 @@ void Renderer::MarkStaticsDirty()
 
 #pragma region PostProcess
 
-bool Renderer::IsBloomEnabled() const { return !m_bloomOff && (m_table->m_bloom_strength > 0.0f) && (g_pplayer->GetInfoMode() <= IF_DYNAMIC_ONLY); }
+bool Renderer::IsBloomEnabled() const { return !m_bloomOff && (m_table->m_bloom_strength * m_bloomStrengthScale > 0.0f) && (g_pplayer->GetInfoMode() <= IF_DYNAMIC_ONLY); }
 
 
 // org HDR -> display HDR spline-based remapping
