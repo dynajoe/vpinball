@@ -95,6 +95,33 @@ void MSGPIAPI VPXPluginAPIImpl::SetActiveViewSetup(VPXViewSetupDef* view)
 {
    assert(g_pplayer); // Only allowed in game
    ViewSetup& viewSetup = g_pplayer->m_ptable->GetViewSetup();
+
+   // A plugin that moves the eye — head tracking is the obvious one — invalidates the
+   // static prepass. The prepass is a baked image of the static parts rendered ONCE
+   // from the camera as it was; the dynamic parts are then composited over it every
+   // frame from the CURRENT camera. Move the camera and the two disagree: the playfield
+   // and the objects sitting on it visibly separate and flash against each other.
+   //
+   // VPX already knows this. Its own point-of-view page calls DisableStaticPrePass(true)
+   // for exactly as long as the camera is being moved (PointOfViewSettingsPage.cpp), and
+   // the editor does the same. But nothing in the plugin API can say it, so a plugin
+   // moving the eye silently gets a corrupt frame — with no clue as to why.
+   //
+   // Disable it once per renderer, the first time a plugin actually moves the eye.
+   // Tables that no plugin touches keep the prepass and lose no performance.
+   const bool eyeMoved = viewSetup.mViewX != view->viewX
+                      || viewSetup.mViewY != view->viewY
+                      || viewSetup.mViewZ != view->viewZ;
+   if (eyeMoved)
+   {
+      static const Renderer* prepassDisabledFor = nullptr;
+      if (prepassDisabledFor != g_pplayer->m_renderer.get())
+      {
+         g_pplayer->m_renderer->DisableStaticPrePass(true);
+         prepassDisabledFor = g_pplayer->m_renderer.get();
+      }
+   }
+
    viewSetup.mViewX = view->viewX;
    viewSetup.mViewY = view->viewY;
    viewSetup.mViewZ = view->viewZ;
