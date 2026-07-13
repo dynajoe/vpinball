@@ -16,6 +16,7 @@
 #include <thread>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <sys/stat.h>
@@ -38,6 +39,7 @@ static std::mutex        g_poseMtx;
 static double            g_pose[6] = {0,0,0,0,0,0};
 static std::atomic<bool> g_haveBase{false};
 static float             g_baseX=0.f, g_baseY=0.f, g_baseZ=0.f;
+static float             g_tableLength = 2000.f;   // VPU; captured with the base
 static long              g_frames = 0;
 static double            g_poseTime = 0.0;
 
@@ -132,7 +134,12 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    VPXViewSetupDef view; vpxApi->GetActiveViewSetup(&view);
    if (!g_haveBase.exchange(true)) {
       g_baseX = view.viewX; g_baseY = view.viewY; g_baseZ = view.viewZ;
-      fprintf(stderr, "HEADTRACK: base eye=(%.2f,%.2f,%.2f) viewMode=%d\n", g_baseX, g_baseY, g_baseZ, view.viewMode); fflush(stderr);
+      VPXTableInfo ti{};
+      vpxApi->GetTableInfo(&ti);
+      if (ti.tableHeight > 1.0f) g_tableLength = ti.tableHeight;   // m_bottom, VPU
+      fprintf(stderr, "HEADTRACK: base eye=(%.2f,%.2f,%.2f) mode=%d tableLen=%.0f wTop=%.1f wBot=%.1f incl=%.1f\n",
+              g_baseX, g_baseY, g_baseZ, view.viewMode, g_tableLength,
+              view.windowTopZOfs, view.windowBottomZOfs, view.screenInclination); fflush(stderr);
    }
    double p[6]; double age;
    { std::lock_guard<std::mutex> lk(g_poseMtx); memcpy(p, g_pose, sizeof(p)); age = nowSec() - g_poseTime; }
@@ -154,15 +161,39 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    // i.e. VPX +Y). Trust the trace over the geometry argument.
    if ((g_frames % 20) == 0) reloadTune();     // pick up a live gain change
    const float g = g_gain;
-   const float x = (float)p[0] * envF("HT_SCALE_X", 1.0f) * envF("HT_SIGN_X", -1.0f) * g;
-   const float up = (float)p[1] * envF("HT_SCALE_Y", 1.0f) * envF("HT_SIGN_Y", 1.0f) * g;
-   const float depth = (float)p[2] * envF("HT_SCALE_Z", 1.0f) * envF("HT_SIGN_Z", -1.0f) * g;
+
+   // Head delta in PLAYER-SPACE centimetres (the space ScreenPlayerX/Y/Z live in):
+   //   pdx  lateral, +right    pdy  +INTO the table (away from player)    pdz  +up
+   const float pdx = (float)p[0] * envF("HT_SIGN_X", -1.0f) * g;
+   const float pdz = (float)p[1] * envF("HT_SIGN_Y", 1.0f) * g;
+   const float pdy = (float)p[2] * envF("HT_SIGN_Z", -1.0f) * g;
+
+   // GEOMETRY-TRUE mapping. VPX converts a player position to an eye by rotating it
+   // around X by (angle between playfield glass and the horizon) minus the screen's
+   // physical inclination — see ViewSetup::SetViewPosFromPlayerPosition. The first
+   // version of this plugin skipped that rotation and added deltas straight onto the
+   // post-transform view axes: every head move landed in a coordinate frame that was
+   // wrong by the glass-slope angle, so height leaked into depth and the scene
+   // STRETCHED instead of behaving like a fixed box behind a window. A comfort gain
+   // of 0.175 was masking a coordinate bug.
+   //
+   // The transform is linear, so the base view (computed by VPX from the measured
+   // static player point) already carries the offset — only the ROTATED delta is
+   // added. Geometry comes live from the view setup itself.
+   const float rad = (float)M_PI / 180.0f;
+   const float ang = atan2f(view.windowTopZOfs - view.windowBottomZOfs, g_tableLength)
+                   - view.screenInclination * rad;
+   const float c = cosf(ang), sn = sinf(ang) * envF("HT_ROT_SIGN", 1.0f);
+   const float CMTOVPU = 50.0f / (2.54f * 1.0625f);   // VPX's own constant, 18.527/cm
+   const float dX = pdx * CMTOVPU;
+   const float dY = (pdy * c - pdz * sn) * CMTOVPU;
+   const float dZ = (pdy * sn + pdz * c) * CMTOVPU;
 
    // Clamp: one bad depth sample must not hurl the camera across the room.
    const float lim = envF("HT_LIMIT_VPU", 700.0f);   // ~38cm at 18.5 VPU/cm
-   view.viewX = g_baseX + clampf(x, -lim, lim);
-   view.viewY = g_baseY + clampf(depth, -lim, lim);   // VPX Y = depth  <- tracker z
-   view.viewZ = g_baseZ + clampf(up, -lim, lim);      // VPX Z = height <- tracker y
+   view.viewX = g_baseX + clampf(dX, -lim, lim);
+   view.viewY = g_baseY + clampf(dY, -lim, lim);
+   view.viewZ = g_baseZ + clampf(dZ, -lim, lim);
    vpxApi->SetActiveViewSetup(&view);
    if ((g_frames++ % 60) == 0) {
       fprintf(stderr, "HEADTRACK: frame %ld pose(x=%.1f up=%.1f depth=%.1f age=%.1fs) -> eye(%.2f,%.2f,%.2f)\n",
