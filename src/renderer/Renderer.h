@@ -179,6 +179,10 @@ public:
    unsigned int m_render_mask = DEFAULT; // Active pass render bit mask
    bool IsRenderPass(const RenderMask pass_mask) const { return (m_render_mask & pass_mask) != 0; }
 
+   // Scales the table author's baked-in bloom strength. Bloom is all-or-nothing in
+   // stock VPX (m_bloom_strength is a per-table property), so a table whose bloom
+   // blows out the playfield can only be fixed by killing bloom entirely.
+   float m_bloomStrengthScale = 1.f;
    ToneMapper m_toneMapper = TM_AGX;
    bool m_HDRforceDisableToneMapper = true;
    float m_exposure = 1.f;

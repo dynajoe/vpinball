@@ -400,6 +400,18 @@ void GraphicSettingsPage::BuildPage()
       [this]() { return m_player->m_renderer->m_bloomOff; }, //
       [this](bool v) { m_player->m_renderer->m_bloomOff = v; }));
 
+   // Live AND persisted: the point of a bloom dial is to drag it against the actual
+   // playfield and keep what you land on. (HDRGlobalExposure above persists but needs a
+   // restart to apply; ForceBloomOff applies live but is not saved from here. This does both.)
+   AddItem(std::make_unique<InGameUIItem>( //
+      Settings::m_propPlayer_BloomStrengthScale, 0.05f, "%4.2f"s, //
+      [this]() { return m_player->m_renderer->m_bloomStrengthScale; }, //
+      [this](float, float v)
+      {
+         m_player->m_renderer->m_bloomStrengthScale = v;
+         m_player->m_ptable->m_settings.SetPlayer_BloomStrengthScale(v, false);
+      }));
+
    AddItem(std::make_unique<InGameUIItem>( //
       Settings::m_propPlayer_ForceMotionBlurOff, //
       [this]() { return m_player->m_renderer->m_motionBlurOff; }, //
