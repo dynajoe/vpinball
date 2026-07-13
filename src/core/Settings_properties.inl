@@ -152,6 +152,7 @@ PropBool(Player, SSRefl, "Additive Screen Space Reflection"s, "Add global reflec
 PropBool(Player, HDRDisableToneMapper, "Disable tonemapping on HDR display"s, "Do not perform tonemapping when rendering on a high dynamic range (HDR) capable monitor/gfxboard/OS"s, true);
 PropFloat(Player, HDRGlobalExposure, "HDR Display Global Exposure"s, "Global exposure scale multiplier for high dynamic range (HDR) capable monitors"s, 0.f, 5.f, 1.f);
 PropBool(Player, ForceBloomOff, "Disable Bloom"s, "Disable postprocessed bloom filter"s, false);
+PropFloat(Player, BloomStrengthScale, "Bloom Strength"s, "Multiplier on the bloom strength set by the table author. Lower it when bloom washes out the playfield; 0 disables bloom entirely, 1.0 leaves the table as authored"s, 0.f, 2.f, 1.f);
 PropBool(Player, ForceMotionBlurOff, "Disable Motion Blur"s, "Disable ball motion blur.\nThis feature is BGFX only (and not supported in VR or headtracking)"s, false);
 PropBool(Player, ForceAnisotropicFiltering, "Force Anisotropic Filtering"s, "Force anisotropic filtering for better rendering quality/texture clarity at the cost of a bit of performance"s, true);
 PropBool(Player, CompressTextures, "Compress Textures"s, "Automatically compress textures at game startup (slow) for better performance"s, false);
