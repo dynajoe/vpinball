@@ -401,6 +401,11 @@ void GraphicSettingsPage::BuildPage()
       [this](bool v) { m_player->m_renderer->m_bloomOff = v; }));
 
    AddItem(std::make_unique<InGameUIItem>( //
+      Settings::m_propPlayer_BloomStrengthScale, 0.05f, "%4.2f"s, //
+      [this]() { return m_player->m_renderer->m_bloomStrengthScale; }, //
+      [this](float, float v) { m_player->m_renderer->m_bloomStrengthScale = v; }));
+
+   AddItem(std::make_unique<InGameUIItem>( //
       Settings::m_propPlayer_ForceMotionBlurOff, //
       [this]() { return m_player->m_renderer->m_motionBlurOff; }, //
       [this](bool v) { m_player->m_renderer->m_motionBlurOff = v; }));
