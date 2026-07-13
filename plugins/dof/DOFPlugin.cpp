@@ -199,6 +199,19 @@ static void OnControllerGameStart(const unsigned int eventId, void* userData, vo
    const CtlOnGameStartMsg* msg = static_cast<const CtlOnGameStartMsg*>(msgData);
    assert(msg != nullptr && msg->gameId != nullptr);
 
+   // A B2S-backed ROM table announces the controller BEFORE the ROM name is set:
+   // the first game start arrives with an EMPTY gameId. Accepting it locked
+   // isRunning with no ROM, the real start (mm_109c) 18ms later was then ignored
+   // as "already running", and DOF spent the whole session with no table config
+   // ("Cant load config ... since no RomName was supplied" -> 0 of 63 outputs
+   // resolved -> dead solenoids). The PUP plugin already ignores empty gameIds;
+   // do the same and let the real announcement start us.
+   if (msg->gameId[0] == '\0')
+   {
+      LOGW("Ignoring game start with empty gameId"s);
+      return;
+   }
+
    // FIXME: Temp fix for issues 3298, 3309, and maybe 3322?
    if (isRunning)
    {
