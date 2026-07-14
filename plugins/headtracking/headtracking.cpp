@@ -6,7 +6,7 @@
 // off-axis "window into the cabinet" perspective. Tracker-agnostic: any source
 // that speaks opentrack UDP (webcam/neuralnet, Kinect, TrackIR, ...) drives it.
 //
-// Config via env: HT_UDP_PORT (default 4242), HT_SCALE_X/Y/Z (VPU per cm, default 1).
+// Config via env: HT_UDP_PORT (4242), HT_SIGN_X/Y/Z, HT_ROT_SIGN, HT_LIMIT_VPU (700),\n// HT_ANCHOR (x,y,z cm). Live gain via ~/.config/vpinfe/ht-tune.conf (gain = ...).
 
 #include "plugins/MsgPlugin.h"
 #include "plugins/VPXPlugin.h"
@@ -58,8 +58,9 @@ static float envF(const char* name, float dflt) { const char* v = getenv(name); 
 //   /userdata/system/.config/vpinfe/ht-tune.conf     gain = 0.35
 //
 // Checked by mtime a few times a second: no cost, and no restart to try a value.
-static float  g_gain = 1.0f;
+static float  g_gain = 0.175f;   // the settled-by-feel default; 1.0 was 'wildly too much'
 static time_t g_tuneMtime = 0;
+static long   g_tuneMtimeNs = 0;   // whole-second mtime equality missed a same-second final write forever
 static const char* tune_path() {
    static std::string p;
    if (p.empty()) {
@@ -71,14 +72,16 @@ static const char* tune_path() {
 static void reloadTune() {
    struct stat st;
    if (stat(tune_path(), &st) != 0) return;
-   if (st.st_mtime == g_tuneMtime) return;
+   if (st.st_mtime == g_tuneMtime && st.st_mtim.tv_nsec == g_tuneMtimeNs) return;
    g_tuneMtime = st.st_mtime;
+   g_tuneMtimeNs = st.st_mtim.tv_nsec;
    FILE* f = fopen(tune_path(), "r");
    if (!f) return;
    char line[128];
    while (fgets(line, sizeof(line), f)) {
       float v;
       if (sscanf(line, " gain = %f", &v) == 1 || sscanf(line, " gain=%f", &v) == 1) {
+         if (!(v >= 0.0f && v <= 2.0f)) continue;   // garbage/NaN must not reach the camera
          g_gain = v;
          fprintf(stderr, "HEADTRACK: gain -> %.3f\n", g_gain); fflush(stderr);
       }
@@ -94,12 +97,21 @@ static double nowSec() {
 
 static void udpListener() {
    int s = socket(AF_INET, SOCK_DGRAM, 0);
-   if (s < 0) return;
+   if (s < 0) { g_running.store(false); return; }
    g_sock = s;
    const int port = envI("HT_UDP_PORT", 4242);
+   const int one = 1;
+   setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));   // rapid table cycling rebinds
    sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-   addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_ANY); addr.sin_port = htons((uint16_t)port);
-   if (bind(s, (sockaddr*)&addr, sizeof(addr)) < 0) { close(s); g_sock=-1; return; }
+   // LOOPBACK, not INADDR_ANY: the tracker sends to 127.0.0.1, and an any-bind
+   // let every host on the LAN/tailscale drive the cab's camera with one datagram.
+   addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons((uint16_t)port);
+   if (bind(s, (sockaddr*)&addr, sizeof(addr)) < 0) {
+      fprintf(stderr, "HEADTRACK: bind :%d failed — listener dead until next game start\n", port); fflush(stderr);
+      close(s); g_sock=-1;
+      g_running.store(false);   // was left true: no retry was possible for the rest of the game
+      return;
+   }
    timeval tv; tv.tv_sec=1; tv.tv_usec=0; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
    fprintf(stderr, "HEADTRACK: UDP listener bound on :%d\n", port); fflush(stderr);
    double buf[6]; long rx=0;
@@ -110,11 +122,16 @@ static void udpListener() {
          if ((rx++ % 60) == 0) { fprintf(stderr, "HEADTRACK: rx #%ld x=%.1f y=%.1f z=%.1f\n", rx, buf[0], buf[1], buf[2]); fflush(stderr); }
       }
    }
-   close(s); g_sock=-1;
+   // The STOPPER owns the close: closing here raced onGameEnd's shutdown() —
+   // a reused fd number could get shutdown() from under another VPX subsystem.
 }
 
 void onGameStart(const unsigned int, void*, void*) {
    g_haveBase.store(false); g_frames = 0; g_poseTime = 0.0;
+   // Per-table proof state. Without this a table whose proof FAILS inherited the
+   // previous table's sign and zOffset and took the absolute path with a foreign
+   // transform — instead of the intended hold-base fallback.
+   g_rotSign = 0.f; g_zOffset = 0.f; g_tableLength = 2000.f;
    if (!g_running.exchange(true)) g_udpThread = std::thread(udpListener);
    if (vpxApi) {
       // MANDATORY when moving the eye. The static prepass is a baked image of the table's
@@ -129,7 +146,11 @@ void onGameStart(const unsigned int, void*, void*) {
 }
 void onGameEnd(const unsigned int, void*, void*) {
    if (vpxApi) vpxApi->DisableStaticPrerendering(0);   // refcounted — give it back
-   if (g_running.exchange(false)) { if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR); if (g_udpThread.joinable()) g_udpThread.join(); }
+   if (g_running.exchange(false)) {
+      if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR);   // unblocks recv
+      if (g_udpThread.joinable()) g_udpThread.join();
+      if (g_sock >= 0) { close(g_sock); g_sock = -1; }   // close only after join
+   }
 }
 void onPrepareFrame(const unsigned int, void*, void*) {
    if (!vpxApi) return;
@@ -188,11 +209,11 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    // y->viewY and z->viewZ, as this plugin originally did, therefore dollies the camera
    // when you nod and slides it vertically when you lean in. Swap them.
    //
-   // Signs, MEASURED, not reasoned. I first argued that the Kinect faces the player so
-   // its +x must be the player's left, and defaulted X to -1. Then I logged an actual
-   // human leaning: left gives x=-19, right gives x=+20. It is NOT mirrored. Depth IS
-   // inverted (leaning in drops z 107->92cm, and "in" means further INTO the table,
-   // i.e. VPX +Y). Trust the trace over the geometry argument.
+   // Signs, SETTLED BY HUMAN TEST at the cab (see headtracking/README.md): the trace
+   // ("left gives x=-19, right gives +20") establishes the TRACKER's axis only — VPX's
+   // +X had to be tested by leaning at the real machine, and -1 is the value that makes
+   // the window move against the head, as a window must. Depth IS inverted (leaning in
+   // drops z, and "in" means further INTO the table, i.e. VPX +Y).
    if ((g_frames % 20) == 0) reloadTune();     // pick up a live gain change
 
    // ABSOLUTE-flagged packets with an UNPROVEN rotation convention must NEVER fall
@@ -215,6 +236,16 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    // space (cm), flagged by p[3]~1000. Full SetViewPosFromPlayerPosition equivalent,
    // using the convention and offset PROVEN against VPX itself at base capture.
    if (p[3] > 900.0 && g_rotSign != 0.f) {
+      // Validate the wire before it becomes the camera: the delta path always
+      // clamped (HT_LIMIT_VPU); the absolute path applied the payload raw — one
+      // corrupt/crafted datagram with NaN or huge values destroyed the
+      // projection for as long as packets flowed. Envelope mirrors the tracker.
+      if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
+          p[0] < -80.0 || p[0] > 80.0 || p[1] < -180.0 || p[1] > -4.0 ||
+          p[2] < 5.0 || p[2] > 140.0) {
+         if ((g_frames++ % 600) == 0) { fprintf(stderr, "HEADTRACK: rejected out-of-envelope absolute packet\n"); fflush(stderr); }
+         return;
+      }
       const float CMTOVPU = 50.0f / (2.54f * 1.0625f);
       const float rad = (float)M_PI / 180.0f;
       const float ang = atan2f(view.windowTopZOfs - view.windowBottomZOfs, g_tableLength)
@@ -288,6 +319,9 @@ MSGPI_EXPORT void MSGPIAPI HeadTrackingPluginLoad(const uint32_t sessionId, cons
 }
 
 MSGPI_EXPORT void MSGPIAPI HeadTrackingPluginUnload() {
+   // If a game is still running (unload without onGameEnd), give back the
+   // static-prepass reference or it stays disabled for the rest of the game.
+   if (g_running.load() && vpxApi) vpxApi->DisableStaticPrerendering(0);
    if (g_running.exchange(false)) { if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR); if (g_udpThread.joinable()) g_udpThread.join(); }
    msgApi->UnsubscribeMsg(onGameStartId, onGameStart, nullptr);
    msgApi->UnsubscribeMsg(onGameEndId, onGameEnd, nullptr);
