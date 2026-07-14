@@ -257,9 +257,13 @@ void onPrepareFrame(const unsigned int, void*, void*) {
       const double smNow = nowSec();
       const double smDt = (smT > 0) ? smNow - smT : 1.0 / 120.0;
       smT = smNow;
-      if (smDt < 0 || smDt > 0.25) smInit = false;   // pause/hitch: snap, don't slew
+      // A render hitch or a stale->resume gap must NOT reset the smoother:
+      // that teleported the camera base->eye in one frame, exactly the jump
+      // this code exists to remove (correctness review). Keep chasing from
+      // wherever the camera was; clamp dt so a long gap becomes a fast
+      // ~0.2s glide instead of an instant snap.
       if (!smInit) { smx = p[0]; smy = p[1]; smz = p[2]; smInit = true; }
-      const double smK = 1.0 - exp(-smDt / 0.040);
+      const double smK = 1.0 - exp(-std::min(smDt > 0 ? smDt : 1.0 / 120.0, 0.1) / 0.040);
       smx += (p[0] - smx) * smK;
       smy += (p[1] - smy) * smK;
       smz += (p[2] - smz) * smK;
