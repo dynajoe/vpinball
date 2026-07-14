@@ -246,14 +246,31 @@ void onPrepareFrame(const unsigned int, void*, void*) {
          if ((g_frames++ % 600) == 0) { fprintf(stderr, "HEADTRACK: rejected out-of-envelope absolute packet\n"); fflush(stderr); }
          return;
       }
+      // The tracker speaks at 30Hz; the render runs at 120. Applying each
+      // packet raw stepped the camera in 4-frame jumps — judder a player
+      // reads as "the graphics are 60Hz" even on a measured 105+fps
+      // playfield. Approach the packet target exponentially per RENDER
+      // frame (tau 40ms): motion is 120Hz-smooth for ~one packet of extra
+      // latency.
+      static double smx = 0, smy = 0, smz = 0, smT = 0;
+      static bool smInit = false;
+      const double smNow = nowSec();
+      const double smDt = (smT > 0) ? smNow - smT : 1.0 / 120.0;
+      smT = smNow;
+      if (smDt < 0 || smDt > 0.25) smInit = false;   // pause/hitch: snap, don't slew
+      if (!smInit) { smx = p[0]; smy = p[1]; smz = p[2]; smInit = true; }
+      const double smK = 1.0 - exp(-smDt / 0.040);
+      smx += (p[0] - smx) * smK;
+      smy += (p[1] - smy) * smK;
+      smz += (p[2] - smz) * smK;
       const float CMTOVPU = 50.0f / (2.54f * 1.0625f);
       const float rad = (float)M_PI / 180.0f;
       const float ang = atan2f(view.windowTopZOfs - view.windowBottomZOfs, g_tableLength)
                       - view.screenInclination * rad;
       const float c = cosf(ang), sn = sinf(ang) * g_rotSign;
-      const float X = (float)p[0] * CMTOVPU;
-      const float Y = (float)p[1] * CMTOVPU;
-      const float Z = (float)p[2] * CMTOVPU;
+      const float X = (float)smx * CMTOVPU;
+      const float Y = (float)smy * CMTOVPU;
+      const float Z = (float)smz * CMTOVPU;
       view.viewX = X;
       view.viewY = Y * c - Z * sn;
       view.viewZ = Y * sn + Z * c + g_zOffset;
