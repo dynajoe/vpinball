@@ -178,7 +178,9 @@ void onPrepareFrame(const unsigned int, void*, void*) {
 
    // Stale pose = no tracker. Fall back to the neutral eye rather than freezing the
    // view at whatever offset it happened to die on.
-   if (age > HT_STALE_S) { p[0] = p[1] = p[2] = 0.0; }
+   // p[3] must clear too: a stale ABSOLUTE packet with only the position zeroed
+   // would be applied as "eye at the glass bottom-centre" instead of falling back.
+   if (age > HT_STALE_S) { p[0] = p[1] = p[2] = p[3] = 0.0; }
 
    // AXES. The tracker speaks opentrack: x=lateral, y=UP, z=DEPTH.
    // VPX does NOT: in ViewSetup, Y is DEPTH and Z is HEIGHT (the cab settings say so
@@ -192,6 +194,22 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    // inverted (leaning in drops z 107->92cm, and "in" means further INTO the table,
    // i.e. VPX +Y). Trust the trace over the geometry argument.
    if ((g_frames % 20) == 0) reloadTune();     // pick up a live gain change
+
+   // ABSOLUTE-flagged packets with an UNPROVEN rotation convention must NEVER fall
+   // through to the delta path below: the eye coordinates get reinterpreted as
+   // deltas — 64cm of eye HEIGHT becomes half a metre of camera retreat at the
+   // tuned gain — and the table shrinks to a birds-eye stamp. Observed on tables
+   // whose base view comes from their own POV override (Tron), where reproducing
+   // the base from HT_ANCHOR is impossible by construction. Hold the base view.
+   if (p[3] > 900.0 && g_rotSign == 0.f) {
+      if ((g_frames++ % 600) == 0) {
+         fprintf(stderr, "HEADTRACK: absolute packets, convention unproven — holding base view\n");
+         fflush(stderr);
+      }
+      view.viewX = g_baseX; view.viewY = g_baseY; view.viewZ = g_baseZ;
+      vpxApi->SetActiveViewSetup(&view);
+      return;
+   }
 
    // ABSOLUTE mode (tracker calibrated to the screen): p[0..2] is the eye in VPX player
    // space (cm), flagged by p[3]~1000. Full SetViewPosFromPlayerPosition equivalent,
