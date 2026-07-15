@@ -337,6 +337,13 @@ static void OnControllerGameStart(const unsigned int eventId, void* userData, vo
    }
    StopColorization();
 
+   // The gameId can be an empty string on an early game-start broadcast.
+   if (msg->gameId[0] == '\0')
+   {
+      LOGW("Ignoring game start with empty gameId"s);
+      return;
+   }
+
    // Setup Serum on the selected DMD
    VPXTableInfo tableInfo;
    vpxApi->GetTableInfo(&tableInfo);
