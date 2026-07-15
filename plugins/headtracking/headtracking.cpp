@@ -241,7 +241,7 @@ void onPrepareFrame(const unsigned int, void*, void*) {
       // corrupt/crafted datagram with NaN or huge values destroyed the
       // projection for as long as packets flowed. Envelope mirrors the tracker.
       if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
-          p[0] < -80.0 || p[0] > 80.0 || p[1] < -180.0 || p[1] > -4.0 ||
+          p[0] < -80.0 || p[0] > 80.0 || p[1] < -180.0 || p[1] > 40.0 ||
           p[2] < 5.0 || p[2] > 140.0) {
          if ((g_frames++ % 600) == 0) { fprintf(stderr, "HEADTRACK: rejected out-of-envelope absolute packet\n"); fflush(stderr); }
          return;
