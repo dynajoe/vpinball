@@ -83,7 +83,7 @@ Window::Window(const string& title, const Settings& settings, VPXWindowId window
    {
       PLOGI << "No display configured. Using display \"" << selectedDisplay.displayId << "\".";
    }
-   else if (selectedDisplay.displayId != configuredDisplay)
+   else if (!MatchesDisplaySpec(configuredDisplay, selectedDisplay))
    {
       PLOGW << "The selected display \"" << configuredDisplay << "\" is not available. Using display \"" << selectedDisplay.displayId << "\" instead.";
    }
@@ -447,13 +447,33 @@ vector<Window::VideoMode> Window::GetDisplayModes(const DisplayConfig& display)
    return modes;
 }
 
+// A display spec is normally the SDL display name — but a monitor whose EDID
+// carries no product name (common behind KVMs and HDMI splitters) gets SDL's
+// fallback name, the numeric display id, which is not stable across sessions
+// and therefore useless as an anchor. "@X,Y" instead anchors to the display
+// whose desktop position is (X,Y): positions are stable wherever the layout
+// is fixed, which is exactly the multi-screen cabinet case.
+bool Window::MatchesDisplaySpec(const string& spec, const DisplayConfig& dispConf)
+{
+   if (spec.size() > 1 && spec[0] == '@')
+   {
+      int posX, posY;
+      if (sscanf(spec.c_str(), "@%d,%d", &posX, &posY) == 2)
+         return dispConf.left == posX && dispConf.top == posY;
+   }
+   // Upstream matches on displayId these days (stable-across-runs id) where it used to
+   // match displayName; accept either so a non-@ spec written under one scheme keeps
+   // resolving under the other. The cab itself always uses @X,Y.
+   return dispConf.displayId == spec || dispConf.displayName == spec;
+}
+
 Window::DisplayConfig Window::GetDisplayConfig(const string& display)
 {
    DisplayConfig selectedDisplay {};
    vector<DisplayConfig> displays = GetDisplays();
    for (const DisplayConfig& dispConf : displays)
    {
-      if (dispConf.displayId == display) // Defaults to the display selected in the settings
+      if (MatchesDisplaySpec(display, dispConf)) // Defaults to the display selected in the settings
       {
          selectedDisplay = dispConf;
          break;
