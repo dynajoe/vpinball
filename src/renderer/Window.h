@@ -131,6 +131,7 @@ public:
    static vector<DisplayConfig> GetDisplays();
    static vector<VideoMode> GetDisplayModes(const DisplayConfig& display);
    static DisplayConfig GetDisplayConfig(const string& displayName);
+   static bool MatchesDisplaySpec(const string& spec, const DisplayConfig& dispConf);
 
 private:
    static VideoMode SDLtoVPXVideoMode(const SDL_DisplayMode* mode);
