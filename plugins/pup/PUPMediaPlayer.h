@@ -83,6 +83,10 @@ private:
    vector<FrameInfo> m_frames;
    SwsContext* m_swsContext = nullptr;
    uint64_t m_lastRenderTicks = 0;
+   int m_lastRenderSlot = -1;
+   VPXTexture m_holdTexture = nullptr;
+
+   bool RenderHoldFrame(VPXRenderContext2D* const ctx, const SDL_Rect& destRect, float alpha);
 
    std::shared_ptr<SDL_Surface> m_mask = nullptr;
    std::unique_ptr<SDL_Surface, void (*)(SDL_Surface*)> m_scaledMask;
