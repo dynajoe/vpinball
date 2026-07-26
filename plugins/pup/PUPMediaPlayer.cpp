@@ -629,9 +629,15 @@ void PUPMediaPlayer::HandleVideoFrame(AVFrame* frame)
    {
       std::lock_guard lock(m_mutex);
       selectedFrame.valid = false;
-      // Read m_bounds under the lock to avoid a data race with SetBounds()
-      targetWidth = m_bounds.w > 0 ? m_bounds.w : m_pVideoContext->width;
-      targetHeight = m_bounds.h > 0 ? m_bounds.h : m_pVideoContext->height;
+      // Convert at the video's NATIVE resolution, not m_bounds: a screen can render
+      // to several differently sized outputs (e.g. the Backglass window plus a table's
+      // hidden VR backglass flasher), and each output's render pass re-bounds the
+      // screen tree to its own size. Scaling to the flip-flopping bounds leaves most
+      // frames pre-scaled for the WRONG output — rendered as a stretched smear (the
+      // video half of #3535; labels got the equivalent stable-size fix already).
+      // DrawImage scales to each output's dest rect at draw time anyway.
+      targetWidth = m_pVideoContext->width;
+      targetHeight = m_pVideoContext->height;
    }
    constexpr AVPixelFormat targetFormat = AV_PIX_FMT_RGBA;
    if ((selectedFrame.frame != nullptr) && ((selectedFrame.frame->width != targetWidth) || (selectedFrame.frame->height != targetHeight)))
