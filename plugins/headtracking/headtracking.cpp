@@ -59,6 +59,11 @@ static float envF(const char* name, float dflt) { const char* v = getenv(name); 
 //
 // Checked by mtime a few times a second: no cost, and no restart to try a value.
 static float  g_gain = 0.175f;   // the settled-by-feel default; 1.0 was 'wildly too much'
+static float  g_renderSmooth = 0.25f;   // per-frame chase toward the target eye (1.0 = raw)
+static int    g_impl = 1;               // ht-tune.conf: impl = 1 (v1 opentrack) | 2 (v2 timestamped)
+static float  g_v2PredictMs = 60.0f;    // ht-tune.conf: v2_predict_ms — render-side dead-reckon horizon
+static bool   g_haveApplied = false;
+static float  g_apX = 0.f, g_apY = 0.f, g_apZ = 0.f;
 static time_t g_tuneMtime = 0;
 static long   g_tuneMtimeNs = 0;   // whole-second mtime equality missed a same-second final write forever
 static const char* tune_path() {
@@ -85,6 +90,22 @@ static void reloadTune() {
          g_gain = v;
          fprintf(stderr, "HEADTRACK: gain -> %.3f\n", g_gain); fflush(stderr);
       }
+      if (sscanf(line, " render_smooth = %f", &v) == 1 || sscanf(line, " render_smooth=%f", &v) == 1) {
+         if (!(v >= 0.05f && v <= 1.0f)) continue;
+         g_renderSmooth = v;
+         fprintf(stderr, "HEADTRACK: render_smooth -> %.2f\n", g_renderSmooth); fflush(stderr);
+      }
+      if (sscanf(line, " impl = %f", &v) == 1 || sscanf(line, " impl=%f", &v) == 1) {
+         const int impl = (v >= 1.5f) ? 2 : 1;
+         if (impl != g_impl) {
+            g_impl = impl;
+            fprintf(stderr, "HEADTRACK: impl -> v%d\n", g_impl); fflush(stderr);
+         }
+      }
+      if (sscanf(line, " v2_predict_ms = %f", &v) == 1 || sscanf(line, " v2_predict_ms=%f", &v) == 1) {
+         if (!(v >= 0.0f && v <= 150.0f)) continue;
+         g_v2PredictMs = v;
+      }
    }
    fclose(f);
 }
@@ -93,6 +114,68 @@ static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi 
 static double nowSec() {
    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
    return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+}
+
+// The sensor delivers poses at its hard 30Hz; the playfield renders at ~120.
+// Applying each pose raw holds the eye for ~4 frames and then jumps — a visible
+// stair-step judder during head motion ("not in sync with refresh rate", as seen
+// at the glass). Chase the target at RENDER rate instead: exponential approach,
+// ~3-frame time constant at the default, live-tunable via render_smooth in
+// ht-tune.conf (1.0 = raw). The ~30ms of added lag hides inside the tracker's
+// existing 60ms forward prediction.
+static void applyView(VPXViewSetupDef& view) {
+   if (g_haveApplied && g_renderSmooth < 0.999f) {
+      const float k = clampf(g_renderSmooth, 0.05f, 1.0f);
+      g_apX += (view.viewX - g_apX) * k;
+      g_apY += (view.viewY - g_apY) * k;
+      g_apZ += (view.viewZ - g_apZ) * k;
+   } else {
+      g_apX = view.viewX; g_apY = view.viewY; g_apZ = view.viewZ;
+   }
+   g_haveApplied = true;
+   view.viewX = g_apX; view.viewY = g_apY; view.viewZ = g_apZ;
+   vpxApi->SetActiveViewSetup(&view);
+}
+
+// ----- v2 experiment: timestamped anchor-relative deltas on port+1 (4243) -----
+// The tracker sends these in PARALLEL with the v1 opentrack stream. impl = 2 in
+// ht-tune.conf switches consumption mid-game: the plugin dead-reckons the packet
+// to render time (capture timestamp + velocity, same CLOCK_MONOTONIC domain)
+// instead of applying the tracker's 30Hz-stepped prediction. No HT_ANCHOR, no
+// rotation-convention proof: deltas ride on whatever base view the table chose.
+struct HtV2Pkt {
+   uint32_t magic;      // "HTV2" little-endian
+   uint32_t state;      // 0 searching, 1 locked, 2 anchor
+   double   t_capture;
+   float    delta[3];   // player-space cm relative to the anchor view, gain applied
+   float    vel[3];     // cm/s
+};
+static std::thread       g_udpThread2;
+static int               g_sock2 = -1;
+static std::mutex        g_v2Mtx;
+static HtV2Pkt           g_v2{};                 // latest packet
+static double            g_v2RxTime = 0.0;
+
+static void udpListenerV2() {
+   int s = socket(AF_INET, SOCK_DGRAM, 0);
+   if (s < 0) return;
+   g_sock2 = s;
+   const int port = envI("HT_UDP_PORT", 4242) + 1;
+   const int one = 1;
+   setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+   sockaddr_in a; memset(&a, 0, sizeof(a));
+   a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((uint16_t)port);
+   if (bind(s, (sockaddr*)&a, sizeof(a)) < 0) { close(s); g_sock2 = -1; return; }
+   timeval tv; tv.tv_sec=1; tv.tv_usec=0; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+   fprintf(stderr, "HEADTRACK: v2 listener bound on :%d\n", port); fflush(stderr);
+   HtV2Pkt p;
+   while (g_running.load()) {
+      ssize_t n = recv(s, &p, sizeof(p), 0);
+      if (n == (ssize_t)sizeof(p) && p.magic == 0x32565448u) {
+         std::lock_guard<std::mutex> lk(g_v2Mtx);
+         g_v2 = p; g_v2RxTime = nowSec();
+      }
+   }
 }
 
 static void udpListener() {
@@ -128,11 +211,15 @@ static void udpListener() {
 
 void onGameStart(const unsigned int, void*, void*) {
    g_haveBase.store(false); g_frames = 0; g_poseTime = 0.0;
+   g_haveApplied = false;   // no cross-table glide from a stale smoothed eye
    // Per-table proof state. Without this a table whose proof FAILS inherited the
    // previous table's sign and zOffset and took the absolute path with a foreign
    // transform — instead of the intended hold-base fallback.
    g_rotSign = 0.f; g_zOffset = 0.f; g_tableLength = 2000.f;
-   if (!g_running.exchange(true)) g_udpThread = std::thread(udpListener);
+   if (!g_running.exchange(true)) {
+      g_udpThread = std::thread(udpListener);
+      g_udpThread2 = std::thread(udpListenerV2);
+   }
    if (vpxApi) {
       // MANDATORY when moving the eye. The static prepass is a baked image of the table's
       // static parts rendered ONCE from the camera as it was; the dynamic parts are then
@@ -148,8 +235,11 @@ void onGameEnd(const unsigned int, void*, void*) {
    if (vpxApi) vpxApi->DisableStaticPrerendering(0);   // refcounted — give it back
    if (g_running.exchange(false)) {
       if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR);   // unblocks recv
+      if (g_sock2 >= 0) shutdown(g_sock2, SHUT_RDWR);
       if (g_udpThread.joinable()) g_udpThread.join();
+      if (g_udpThread2.joinable()) g_udpThread2.join();
       if (g_sock >= 0) { close(g_sock); g_sock = -1; }   // close only after join
+      if (g_sock2 >= 0) { close(g_sock2); g_sock2 = -1; }
    }
 }
 void onPrepareFrame(const unsigned int, void*, void*) {
@@ -216,6 +306,45 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    // drops z, and "in" means further INTO the table, i.e. VPX +Y).
    if ((g_frames % 20) == 0) reloadTune();     // pick up a live gain change
 
+   // ----- impl = 2: timestamped v2 path (see HtV2Pkt) -----
+   // Dead-reckon the anchor-relative delta to THIS frame's time using the packet
+   // velocity, rotate with live geometry, ride the table's own base view. Falls
+   // back to v1 below when v2 packets are stale (tracker predates the experiment).
+   if (g_impl == 2) {
+      HtV2Pkt v2; double rxAge;
+      { std::lock_guard<std::mutex> lk(g_v2Mtx); v2 = g_v2; rxAge = nowSec() - g_v2RxTime; }
+      if (g_v2RxTime > 0.0 && rxAge < HT_STALE_S) {
+         float dx = 0.f, dy = 0.f, dz = 0.f;
+         if (v2.state == 1) {
+            // horizon = data age (capture to now) + tuned lead; capped so one late
+            // packet cannot fling the eye
+            const double lead = (nowSec() - v2.t_capture) + (double)g_v2PredictMs / 1000.0;
+            const float h = (float)std::min(std::max(lead, 0.0), 0.15);
+            dx = v2.delta[0] + v2.vel[0] * h;
+            dy = v2.delta[1] + v2.vel[1] * h;
+            dz = v2.delta[2] + v2.vel[2] * h;
+         }
+         // player-space cm -> view VPU, rotated by the live glass-plane angle
+         // (identical math to the v1 delta path; deltas need no anchor proof)
+         const float rad2 = (float)M_PI / 180.0f;
+         const float ang2 = atan2f(view.windowTopZOfs - view.windowBottomZOfs, g_tableLength)
+                          - view.screenInclination * rad2;
+         const float c2 = cosf(ang2), sn2 = sinf(ang2) * envF("HT_ROT_SIGN", 1.0f);
+         const float CMTOVPU2 = 50.0f / (2.54f * 1.0625f);
+         const float lim2 = envF("HT_LIMIT_VPU", 700.0f);
+         view.viewX = g_baseX + clampf(dx * CMTOVPU2, -lim2, lim2);
+         view.viewY = g_baseY + clampf((dy * c2 - dz * sn2) * CMTOVPU2, -lim2, lim2);
+         view.viewZ = g_baseZ + clampf((dy * sn2 + dz * c2) * CMTOVPU2, -lim2, lim2);
+         applyView(view);
+         if ((g_frames++ % 120) == 0) {
+            fprintf(stderr, "HEADTRACK: v2 state=%u d(%.1f,%.1f,%.1f)cm age=%.0fms -> view(%.1f,%.1f,%.1f)\n",
+                    v2.state, dx, dy, dz, (nowSec() - v2.t_capture) * 1000.0, view.viewX, view.viewY, view.viewZ);
+            fflush(stderr);
+         }
+         return;
+      }
+   }
+
    // ABSOLUTE-flagged packets with an UNPROVEN rotation convention must NEVER fall
    // through to the delta path below: the eye coordinates get reinterpreted as
    // deltas — 64cm of eye HEIGHT becomes half a metre of camera retreat at the
@@ -228,7 +357,7 @@ void onPrepareFrame(const unsigned int, void*, void*) {
          fflush(stderr);
       }
       view.viewX = g_baseX; view.viewY = g_baseY; view.viewZ = g_baseZ;
-      vpxApi->SetActiveViewSetup(&view);
+      applyView(view);
       return;
    }
 
@@ -278,7 +407,7 @@ void onPrepareFrame(const unsigned int, void*, void*) {
       view.viewX = X;
       view.viewY = Y * c - Z * sn;
       view.viewZ = Y * sn + Z * c + g_zOffset;
-      vpxApi->SetActiveViewSetup(&view);
+      applyView(view);
       if ((g_frames++ % 60) == 0) {
          fprintf(stderr, "HEADTRACK: ABS eye(%.1f,%.1f,%.1f)cm -> view(%.1f,%.1f,%.1f)\n",
                  p[0], p[1], p[2], view.viewX, view.viewY, view.viewZ); fflush(stderr);
@@ -320,7 +449,7 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    view.viewX = g_baseX + clampf(dX, -lim, lim);
    view.viewY = g_baseY + clampf(dY, -lim, lim);
    view.viewZ = g_baseZ + clampf(dZ, -lim, lim);
-   vpxApi->SetActiveViewSetup(&view);
+   applyView(view);
    if ((g_frames++ % 60) == 0) {
       fprintf(stderr, "HEADTRACK: frame %ld pose(x=%.1f up=%.1f depth=%.1f age=%.1fs) -> eye(%.2f,%.2f,%.2f)\n",
               g_frames, p[0], p[1], p[2], age, view.viewX, view.viewY, view.viewZ); fflush(stderr);
