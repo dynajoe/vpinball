@@ -59,6 +59,9 @@ static float envF(const char* name, float dflt) { const char* v = getenv(name); 
 //
 // Checked by mtime a few times a second: no cost, and no restart to try a value.
 static float  g_gain = 0.175f;   // the settled-by-feel default; 1.0 was 'wildly too much'
+static float  g_renderSmooth = 0.25f;   // per-frame chase toward the target eye (1.0 = raw)
+static bool   g_haveApplied = false;
+static float  g_apX = 0.f, g_apY = 0.f, g_apZ = 0.f;
 static time_t g_tuneMtime = 0;
 static long   g_tuneMtimeNs = 0;   // whole-second mtime equality missed a same-second final write forever
 static const char* tune_path() {
@@ -85,6 +88,11 @@ static void reloadTune() {
          g_gain = v;
          fprintf(stderr, "HEADTRACK: gain -> %.3f\n", g_gain); fflush(stderr);
       }
+      if (sscanf(line, " render_smooth = %f", &v) == 1 || sscanf(line, " render_smooth=%f", &v) == 1) {
+         if (!(v >= 0.05f && v <= 1.0f)) continue;
+         g_renderSmooth = v;
+         fprintf(stderr, "HEADTRACK: render_smooth -> %.2f\n", g_renderSmooth); fflush(stderr);
+      }
    }
    fclose(f);
 }
@@ -93,6 +101,27 @@ static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi 
 static double nowSec() {
    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
    return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+}
+
+// The sensor delivers poses at its hard 30Hz; the playfield renders at ~120.
+// Applying each pose raw holds the eye for ~4 frames and then jumps — a visible
+// stair-step judder during head motion ("not in sync with refresh rate", as seen
+// at the glass). Chase the target at RENDER rate instead: exponential approach,
+// ~3-frame time constant at the default, live-tunable via render_smooth in
+// ht-tune.conf (1.0 = raw). The ~30ms of added lag hides inside the tracker's
+// existing 60ms forward prediction.
+static void applyView(VPXViewSetupDef& view) {
+   if (g_haveApplied && g_renderSmooth < 0.999f) {
+      const float k = clampf(g_renderSmooth, 0.05f, 1.0f);
+      g_apX += (view.viewX - g_apX) * k;
+      g_apY += (view.viewY - g_apY) * k;
+      g_apZ += (view.viewZ - g_apZ) * k;
+   } else {
+      g_apX = view.viewX; g_apY = view.viewY; g_apZ = view.viewZ;
+   }
+   g_haveApplied = true;
+   view.viewX = g_apX; view.viewY = g_apY; view.viewZ = g_apZ;
+   vpxApi->SetActiveViewSetup(&view);
 }
 
 static void udpListener() {
@@ -128,6 +157,7 @@ static void udpListener() {
 
 void onGameStart(const unsigned int, void*, void*) {
    g_haveBase.store(false); g_frames = 0; g_poseTime = 0.0;
+   g_haveApplied = false;   // no cross-table glide from a stale smoothed eye
    // Per-table proof state. Without this a table whose proof FAILS inherited the
    // previous table's sign and zOffset and took the absolute path with a foreign
    // transform — instead of the intended hold-base fallback.
@@ -228,7 +258,7 @@ void onPrepareFrame(const unsigned int, void*, void*) {
          fflush(stderr);
       }
       view.viewX = g_baseX; view.viewY = g_baseY; view.viewZ = g_baseZ;
-      vpxApi->SetActiveViewSetup(&view);
+      applyView(view);
       return;
    }
 
@@ -278,7 +308,7 @@ void onPrepareFrame(const unsigned int, void*, void*) {
       view.viewX = X;
       view.viewY = Y * c - Z * sn;
       view.viewZ = Y * sn + Z * c + g_zOffset;
-      vpxApi->SetActiveViewSetup(&view);
+      applyView(view);
       if ((g_frames++ % 60) == 0) {
          fprintf(stderr, "HEADTRACK: ABS eye(%.1f,%.1f,%.1f)cm -> view(%.1f,%.1f,%.1f)\n",
                  p[0], p[1], p[2], view.viewX, view.viewY, view.viewZ); fflush(stderr);
@@ -320,7 +350,7 @@ void onPrepareFrame(const unsigned int, void*, void*) {
    view.viewX = g_baseX + clampf(dX, -lim, lim);
    view.viewY = g_baseY + clampf(dY, -lim, lim);
    view.viewZ = g_baseZ + clampf(dZ, -lim, lim);
-   vpxApi->SetActiveViewSetup(&view);
+   applyView(view);
    if ((g_frames++ % 60) == 0) {
       fprintf(stderr, "HEADTRACK: frame %ld pose(x=%.1f up=%.1f depth=%.1f age=%.1fs) -> eye(%.2f,%.2f,%.2f)\n",
               g_frames, p[0], p[1], p[2], age, view.viewX, view.viewY, view.viewZ); fflush(stderr);
