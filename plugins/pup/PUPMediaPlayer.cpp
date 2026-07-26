@@ -260,6 +260,23 @@ void PUPMediaPlayer::StopBlocking()
    m_pVideoContext = nullptr;
    m_videoStream = -1;
 
+   // Across a play-to-play switch (a new Play is pending), keep the most recently
+   // shown frame alive so Render can bridge the gap until the next file's first
+   // frame is decoded — a real machine's screen never blanks between clips. On a
+   // final stop there is nothing to bridge: drop any held image too.
+   if (m_holdTexture != nullptr)
+   {
+      DeleteTexture(m_holdTexture);
+      m_holdTexture = nullptr;
+   }
+   if (m_pendingPlay.load(std::memory_order_relaxed) > 0 && m_lastRenderSlot >= 0
+      && m_lastRenderSlot < static_cast<int>(m_frames.size()) && m_frames[m_lastRenderSlot].uploaded && m_frames[m_lastRenderSlot].texture != nullptr)
+   {
+      m_holdTexture = m_frames[m_lastRenderSlot].texture;
+      m_frames[m_lastRenderSlot].texture = nullptr;
+   }
+   m_lastRenderSlot = -1;
+
    for (auto& frame : m_frames)
    {
       if (frame.frame)
@@ -333,12 +350,34 @@ void PUPMediaPlayer::SetLength(int length)
    });
 }
 
+// Draw the last frame this player showed, if one is still alive — used to bridge
+// the frameless gaps at video switches, decoder warm-up and loop restarts, where
+// drawing nothing would let the (black) background flash through the layer stack
+// for a frame or two. Returns true when something was drawn. m_mutex must be held.
+bool PUPMediaPlayer::RenderHoldFrame(VPXRenderContext2D* const ctx, const SDL_Rect& destRect, float alpha)
+{
+   VPXTexture tex = m_holdTexture;
+   if (m_lastRenderSlot >= 0 && m_lastRenderSlot < static_cast<int>(m_frames.size()) && m_frames[m_lastRenderSlot].uploaded && m_frames[m_lastRenderSlot].texture != nullptr)
+      tex = m_frames[m_lastRenderSlot].texture;
+   if (tex == nullptr)
+      return false;
+   const VPXTextureInfo* texInfo = GetTextureInfo(tex);
+   ctx->DrawImage(ctx, tex, 1.f, 1.f, 1.f, alpha, 0.f, 0.f, static_cast<float>(texInfo->width), static_cast<float>(texInfo->height), 0.f, 0.f, 0.f,
+      static_cast<float>(destRect.x), static_cast<float>(destRect.y), static_cast<float>(destRect.w), static_cast<float>(destRect.h));
+   return true;
+}
+
 void PUPMediaPlayer::Render(VPXRenderContext2D* const ctx, const SDL_Rect& destRect, float alpha)
 {
-   if (!m_running)
-      return;
-
    std::lock_guard lock(m_mutex);
+
+   if (!m_running)
+   {
+      // Between a Stop and the next file's first frame (play-to-play switch), hold
+      // the previous image instead of leaving the layer empty
+      RenderHoldFrame(ctx, destRect, alpha);
+      return;
+   }
 
    const uint64_t nowTicks = SDL_GetTicks();
    const uint64_t renderGap = m_lastRenderTicks != 0 ? (nowTicks - m_lastRenderTicks) : 0;
@@ -377,7 +416,12 @@ void PUPMediaPlayer::Render(VPXRenderContext2D* const ctx, const SDL_Rect& destR
       }
    }
    if (selectedFrameSlot == -1)
+   {
+      // No decoded frame near the play position (decoder warm-up, loop hard-reset):
+      // hold the previous image rather than flashing the background through
+      RenderHoldFrame(ctx, destRect, alpha);
       return;
+   }
    FrameInfo& selectedFrame = m_frames[selectedFrameSlot];
 
    if (!selectedFrame.uploaded)
@@ -401,6 +445,14 @@ void PUPMediaPlayer::Render(VPXRenderContext2D* const ctx, const SDL_Rect& destR
       static_cast<float>(destRect.x), static_cast<float>(destRect.y), static_cast<float>(destRect.w), static_cast<float>(destRect.h));
 
    selectedFrame.age = 0;
+   m_lastRenderSlot = selectedFrameSlot;
+
+   // A fresh frame made it to screen: the held bridge image (if any) is stale now
+   if (m_holdTexture != nullptr)
+   {
+      DeleteTexture(m_holdTexture);
+      m_holdTexture = nullptr;
+   }
 }
 
 void PUPMediaPlayer::Run()
@@ -633,7 +685,7 @@ void PUPMediaPlayer::HandleVideoFrame(AVFrame* frame)
       // to several differently sized outputs (e.g. the Backglass window plus a table's
       // hidden VR backglass flasher), and each output's render pass re-bounds the
       // screen tree to its own size. Scaling to the flip-flopping bounds leaves most
-      // frames pre-scaled for the WRONG output — rendered as a stretched smear (the
+      // frames pre-scaled for the WRONG output — drawn as a stretched smear (the
       // video half of #3535; labels got the equivalent stable-size fix already).
       // DrawImage scales to each output's dest rect at draw time anyway.
       targetWidth = m_pVideoContext->width;
