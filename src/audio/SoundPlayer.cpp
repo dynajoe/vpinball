@@ -220,6 +220,15 @@ SoundPlayer::SoundPlayer(const AudioPlayer* audioPlayer, const string& filename)
       SetThreadName("VPX.SoundPlayer ["s.append(filename).append(1, ']'));
 
       ma_engine* engine = m_audioPlayer->GetEngine(m_outputTarget);
+      if (engine == nullptr)
+      {
+         // The engine is missing when its audio device failed to open (see AudioPlayer
+         // ctor). ma_engine_get_node_graph(nullptr) returns nullptr and miniaudio's
+         // ma_node_init does not null-check the graph: ma_node_get_heap_layout reads
+         // through it and segfaults. Skip playback instead of crashing.
+         PLOGE << "No audio engine (audio device failed to open), music '" << filename << "' will not be played";
+         return;
+      }
 
       // Add custom node for channel mixing
       m_vpxMixNode = std::make_unique<vpx_node>();
@@ -272,6 +281,15 @@ SoundPlayer::SoundPlayer(const AudioPlayer* audioPlayer, Sound* sound)
       SetThreadName("VPX.SoundPlayer ["s.append(sound->GetName()).append(1, ']'));
 
       ma_engine* engine = m_audioPlayer->GetEngine(m_outputTarget);
+      if (engine == nullptr)
+      {
+         // The engine is missing when its audio device failed to open (see AudioPlayer
+         // ctor). ma_engine_get_node_graph(nullptr) returns nullptr and miniaudio's
+         // ma_node_init does not null-check the graph: ma_node_get_heap_layout reads
+         // through it and segfaults. Skip playback instead of crashing.
+         PLOGE << "No audio engine (audio device failed to open), sound '" << sound->GetName() << "' will not be played";
+         return;
+      }
 
       // Add custom node for channel mixing
       m_vpxMixNode = std::make_unique<vpx_node>();
