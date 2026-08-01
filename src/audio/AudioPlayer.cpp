@@ -382,9 +382,21 @@ AudioPlayer::AudioStreamID AudioPlayer::OpenAudioStream(const string& name, int 
 {
    if (m_backglassSDLDevice == 0)
    {
+      // Only try to open the device once: callers (e.g. plugin audio through
+      // Player::OnAudioUpdated) retry failed streams on every audio update, so an
+      // unopenable device would otherwise be re-opened and re-logged tens of times per
+      // second for the whole session.
+      if (m_backglassSDLDeviceOpenFailed)
+         return nullptr;
       SDL_AudioSpec deviceSpec;
       const bool hasDeviceSpec = SDL_GetAudioDeviceFormat(m_backglassAudioDevice, &deviceSpec, nullptr);
       m_backglassSDLDevice = SDL_OpenAudioDevice(m_backglassAudioDevice, hasDeviceSpec ? & deviceSpec : nullptr);
+      if (m_backglassSDLDevice == 0)
+      {
+         m_backglassSDLDeviceOpenFailed = true;
+         PLOGE << "Failed to open backglass audio device '" << GetBackglassDeviceName() << "' for audio streams: " << SDL_GetError() << ". Audio streams are disabled for this session.";
+         return nullptr;
+      }
    }
    std::unique_ptr<AudioStreamPlayer> audioStream = AudioStreamPlayer::Create(m_backglassSDLDevice, frequency, channels, isFloat);
    if (audioStream == nullptr)
