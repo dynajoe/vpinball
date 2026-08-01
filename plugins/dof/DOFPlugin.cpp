@@ -15,9 +15,12 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <cstdio>
 #include <cassert>
+#include <cctype>
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
@@ -194,17 +197,70 @@ private:
 
 static std::unique_ptr<DOFEventConsumer> dofThread;
 
+// B2SServer/B2SLegacy register a controller with an UNNAMED game as "b2s::<random
+// RFC4122 GUID>" (SetB2SName generates one while the name is empty) and re-broadcast
+// controllers-changed once the script supplies the real name. Selecting the GUID
+// would Init DOF against a name that matches no directoutputconfig row, open the
+// output hardware, then tear it all down and reopen milliseconds later when the
+// real name arrives — the new-consumer shape of the old "empty gameId" problem (a
+// B2S announces BEFORE its ROM name is set). Recognize the placeholder and wait
+// for the re-broadcast instead (the consumer filter drops it, so the list stays
+// empty until the real name arrives). A real B2S name is a ROM-ish short name;
+// none has the 8-4-4-4-12 hex layout.
+static bool IsUnnamedB2SGameId(const string& gameId)
+{
+   if (gameId.length() != 36)
+      return false;
+   for (size_t i = 0; i < 36; i++)
+   {
+      if (i == 8 || i == 13 || i == 18 || i == 23)
+      {
+         if (gameId[i] != '-')
+            return false;
+      }
+      else if (!isxdigit(static_cast<unsigned char>(gameId[i])))
+         return false;
+   }
+   return true;
+}
+
+static string currentGameId; // identity the running DOFEventConsumer was initialized for
+
 static void SetupDOF()
 {
    const ControllerDef controller = controllers->With([](const std::vector<ControllerDef>& items) { return items.empty() ? ControllerDef { } : items.front(); });
-   if (controller.gameId == nullptr || controller.endpointId == 0)
+   // The consumer filter admits PinMAME games and named B2S games, PinMAME first,
+   // so front() is the best identity available. Strip whichever prefix it carries.
+   // The b2s:: id is lowercased at the source and libdof matches ROM names
+   // case-insensitively (LedControlConfigList upper-cases both sides), so the
+   // stripped id hits the same config row a PinMAME identity would.
+   string gameId;
+   if (controller.gameId != nullptr && controller.endpointId != 0)
+   {
+      const string pinmamePrefix(PMPI_GAMEID_PREFIX);
+      const string b2sPrefix("b2s::"); // same literal B2SServer.cpp / b2slegacy/Server.cpp register with; there is no shared define
+      const string raw(controller.gameId);
+      if (raw.starts_with(pinmamePrefix))
+         gameId = raw.substr(pinmamePrefix.length());
+      else if (raw.starts_with(b2sPrefix))
+         gameId = raw.substr(b2sPrefix.length());
+   }
+
+   // Identity-level dedup: the controller LIST churns without the identity
+   // changing — a ROM table's B2S announces after PinMAME ([pm] -> [pm, b2s]),
+   // and late re-broadcasts arrive mid-game. Since the filter above admits B2S
+   // controllers, list-level dedup alone would tear down and rebuild the
+   // consumer on such churn: output hardware close/reopen and a full libdof
+   // re-Init at table load, with the SAME gameId. Only touch the running
+   // consumer when the selected identity actually changed.
+   if (gameId == currentGameId)
       return;
-   const string pinmamePrefix(PMPI_GAMEID_PREFIX);
-   const string gameId = string(controller.gameId).substr(pinmamePrefix.length());
-   if (gameId.empty())
+   dofThread = nullptr;
+   currentGameId = gameId;
+   if (gameId.empty() || pDOF == nullptr)
       return;
-   
-   LOGI("New PinMAME game started: gameId=" + gameId);
+
+   LOGI("New controller game started: gameId=" + gameId);
    VPXTableInfo tableInfo;
    vpxApi->GetTableInfo(&tableInfo);
    string path = tableInfo.path;
@@ -239,10 +295,33 @@ MSGPI_EXPORT void MSGPIAPI DOFPluginLoad(const uint32_t sessionId, const MsgPlug
       msgApi, endpointId, CTLPI_CONTROLLERS_GET_MSG, CTLPI_CONTROLLERS_ON_CHG_MSG,
       [](std::vector<ControllerDef>& items)
       {
+         // Keep PinMAME games, and NAMED B2S games as a fallback identity: on ROM-less
+         // tables (Stern SPIKE-era originals like Guardians of the Galaxy) B2S.Server is
+         // the ONLY source of the game's identity — there is no PinMAME controller at
+         // all. A PinMAME-only filter silently kills DOF on every such table: Init()
+         // never runs, so no table config, 0 toys, and the output hardware never opens,
+         // while the log stays clean (libdof cannot complain about a missing RomName if
+         // it is never initialized). Measured on the cab: Guardians 40 toys -> 0.
          const string pinmamePrefix(PMPI_GAMEID_PREFIX);
-         std::erase_if(items, [&pinmamePrefix](const ControllerDef& src) { return !string(src.gameId).starts_with(pinmamePrefix); });
+         const string b2sPrefix("b2s::");
+         std::erase_if(items, [&pinmamePrefix, &b2sPrefix](const ControllerDef& src)
+         {
+            const string gameId(src.gameId);
+            if (gameId.starts_with(pinmamePrefix))
+               return false;
+            if (gameId.starts_with(b2sPrefix))
+               return IsUnnamedB2SGameId(gameId.substr(b2sPrefix.length()));
+            return true;
+         });
+         // A PinMAME identity wins when both are present: SetupDOF uses items.front()
+         std::stable_partition(items.begin(), items.end(),
+            [&pinmamePrefix](const ControllerDef& src) { return string(src.gameId).starts_with(pinmamePrefix); });
       },
-      []() { dofThread = nullptr; },
+      // Deliberately NOT tearing dofThread down here: DOFEventConsumer copies its
+      // identity strings and borrows nothing from the item list, so it may outlive
+      // a list change. SetupDOF (below) destroys it iff the selected identity
+      // actually changed — see the dedup comment there.
+      []() { },
       []() { SetupDOF(); });
    controllers->Subscribe();
 }
