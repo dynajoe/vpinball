@@ -14,9 +14,12 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <cstdio>
 #include <cassert>
+#include <cctype>
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
@@ -251,20 +254,76 @@ private:
 
 static std::unique_ptr<DOFEventConsumer> dofThread;
 
+// B2SServer/B2SLegacy register a controller with an UNNAMED game as "b2s::<random
+// RFC4122 GUID>" (SetB2SName generates one while the name is empty) and re-broadcast
+// controllers-changed once the script supplies the real name. Selecting the GUID
+// would Init DOF against a name that matches no directoutputconfig row, open the
+// output hardware, then tear it all down and reopen milliseconds later when the
+// real name arrives — the new-consumer shape of the old "empty gameId" problem (a
+// B2S announces BEFORE its ROM name is set). Recognize the placeholder and wait
+// for the re-broadcast instead (the consumer filter drops it, so the list stays
+// empty until the real name arrives). A real B2S name is a ROM-ish short name;
+// none has the 8-4-4-4-12 hex layout.
+static bool IsUnnamedB2SGameId(const string& gameId)
+{
+   if (gameId.length() != 36)
+      return false;
+   for (size_t i = 0; i < 36; i++)
+   {
+      if (i == 8 || i == 13 || i == 18 || i == 23)
+      {
+         if (gameId[i] != '-')
+            return false;
+      }
+      else if (!isxdigit(static_cast<unsigned char>(gameId[i])))
+         return false;
+   }
+   return true;
+}
+
+static string currentRomName; // resolved ROM identity the running DOFEventConsumer was initialized for
+
 static void SetupDOF()
 {
    const ControllerDef controller = controllers->With([](const std::vector<ControllerDef>& items) { return items.empty() ? ControllerDef { } : items.front(); });
-   if (controller.gameId == nullptr || controller.endpointId == 0)
+
+   // Resolve the selected controller to the ROM identity DOF would be initialized for.
+   // Upstream 7f2c70ad3 now covers the cab's B2S fallback (SPIKE tables with no PinMAME
+   // controller): the consumer filter scores every namespace against the DOF rom list and
+   // falls back to any named controller, and ResolveRomName falls back to the bare game
+   // key — the same config row the cab's stripped b2s:: id hit (libdof matches ROM names
+   // case-insensitively).
+   string romName;
+   std::string_view gameNs, gameKey;
+   if (controller.gameId != nullptr && controller.endpointId != 0)
+   {
+      gameNs = PinballPlugin::Controller::CtrlGetGameNamespace(controller.gameId);
+      gameKey = PinballPlugin::Controller::CtrlGetGameKey(controller.gameId);
+      if (!gameKey.empty())
+      {
+         VPXTableInfo tableInfo {};
+         vpxApi->GetTableInfo(&tableInfo);
+         romName = ResolveRomName(gameNs, gameKey, LoadRomList(PluginStrings::PathFromNative(tableInfo.path)));
+      }
+   }
+
+   // Identity-level dedup (cab behaviour preserved across the 2026-10-03 rebase): the
+   // controller LIST churns without the ROM identity changing — a ROM table's B2S
+   // announces after PinMAME, PinMAME can announce after an already-named B2S, and late
+   // re-broadcasts arrive mid-game. List-level teardown would close and reopen the output
+   // hardware and fully re-Init libdof at table load with the SAME identity. The
+   // on-change callback is therefore a no-op and only an actual change of the resolved
+   // ROM identity touches the running consumer.
+   if (romName == currentRomName)
       return;
-   const std::string_view gameNs = PinballPlugin::Controller::CtrlGetGameNamespace(controller.gameId);
-   const std::string_view gameKey = PinballPlugin::Controller::CtrlGetGameKey(controller.gameId);
-   if (gameKey.empty())
+   dofThread = nullptr;
+   currentRomName = romName;
+   if (romName.empty())
       return;
 
    VPXTableInfo tableInfo {};
    vpxApi->GetTableInfo(&tableInfo);
    const string path = tableInfo.path ? tableInfo.path : ""; // Native narrow path, as libDOF expects
-   const string romName = ResolveRomName(gameNs, gameKey, LoadRomList(PluginStrings::PathFromNative(tableInfo.path)));
 
    LOGI("New game started: gameId="s + controller.gameId + ", romName=" + romName);
    dofThread = std::make_unique<DOFEventConsumer>(path, romName, controller);
@@ -319,6 +378,13 @@ MSGPI_EXPORT void MSGPIAPI DOFPluginLoad(const uint32_t sessionId, const MsgPlug
             const std::string_view gameKey = PinballPlugin::Controller::CtrlGetGameKey(controller.gameId);
             if (gameKey.empty())
                continue;
+            // Cab: skip B2S's unnamed-game placeholder (a random GUID registered before the
+            // script supplies the real name) — selecting it would Init DOF against a name
+            // matching no config row, open the output hardware, then tear it down and reopen
+            // milliseconds later when the re-broadcast with the real name arrives. See
+            // IsUnnamedB2SGameId above.
+            if (gameNs == "b2s"sv && IsUnnamedB2SGameId(std::string(gameKey)))
+               continue;
             const bool pinmame = gameNs == "pinmame"sv;
             const bool match = (!gameNs.empty() && RomListContains(romList, std::string(gameNs) + '_' + std::string(gameKey))) || RomListContains(romList, gameKey);
             const int score = (match ? 2 : 0) + (pinmame ? 1 : 0);
@@ -334,7 +400,11 @@ MSGPI_EXPORT void MSGPIAPI DOFPluginLoad(const uint32_t sessionId, const MsgPlug
          if (selected != nullptr)
             items.push_back(*selected);
       },
-      []() { dofThread = nullptr; }, []() { SetupDOF(); });
+      // Deliberately NOT tearing dofThread down here (cab behaviour): DOFEventConsumer
+      // copies its identity strings and borrows nothing from the item list, so it may
+      // outlive a list change. SetupDOF destroys it iff the resolved ROM identity
+      // actually changed — see the dedup comment there.
+      []() { }, []() { SetupDOF(); });
    controllers->Subscribe();
 }
 
