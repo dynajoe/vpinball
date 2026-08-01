@@ -124,6 +124,7 @@ private:
    vector<AudioStreamID> m_audioStreams;
    vector<AudioStreamID> m_pendingDeleteAudioStreams;
    SDL_AudioDeviceID m_backglassSDLDevice = 0;
+   bool m_backglassSDLDeviceOpenFailed = false; // Open is attempted lazily and only once; see OpenAudioStream
 
    std::unique_ptr<class SoundPlayer> m_music;
 
