@@ -8,12 +8,27 @@ namespace VPX
 
 std::unique_ptr<AudioStreamPlayer> AudioStreamPlayer::Create(SDL_AudioDeviceID sdlDevice, int frequency, int channels, bool isFloat)
 {
+   if (sdlDevice == 0)
+   {
+      // 0 is not a valid SDL audio device id: the caller's SDL_OpenAudioDevice failed (or
+      // was never attempted), so there is no device to bind a stream to. Fail here with
+      // the real cause instead of letting SDL report a confusing downstream error.
+      PLOGE << "Failed to create audio stream: no opened audio device to bind to";
+      return nullptr;
+   }
    SDL_AudioSpec streamSpec;
    streamSpec.freq = frequency;
    streamSpec.format = isFloat ? SDL_AUDIO_F32 : SDL_AUDIO_S16;
    streamSpec.channels = channels;
    SDL_AudioSpec deviceSpec;
-   SDL_GetAudioDeviceFormat(sdlDevice, &deviceSpec, nullptr);
+   if (!SDL_GetAudioDeviceFormat(sdlDevice, &deviceSpec, nullptr))
+   {
+      // On failure deviceSpec is left uninitialized; passing it to SDL_CreateAudioStream
+      // used to surface as "Parameter 'dst_spec->format' is invalid", which points at the
+      // stream format instead of the failed device query.
+      PLOGE << "Failed to create audio stream: could not query audio device format: " << SDL_GetError();
+      return nullptr;
+   }
    SDL_AudioStream* stream = SDL_CreateAudioStream(&streamSpec, &deviceSpec);
    if (stream)
    {
