@@ -103,14 +103,20 @@ namespace VPX::DMDProbe
    void Init();
 
    // Out-of-line counting; call only through the inline gates below.
-   void CountIngest(size_t bytes);
+   void CountIngest(unsigned int width, unsigned int height, unsigned int pixelSize);
    void CountPluginIngest();
    void CountStage();
    void CountGpuUpload();
    void CountRenderFlip();
 
    // Hot-path gates: a relaxed bool load when disabled, atomics when enabled.
-   inline void OnIngest(size_t bytes) { if (IsEnabled()) CountIngest(bytes); }
+   // Ingest takes the frame geometry, not pre-multiplied bytes: the 2026-08-02
+   // cab measurement was mis-attributed for hours because the aggregate byte
+   // rate admitted several size×rate factorizations (a 1080p surface at 100/s
+   // and a 1.7Mpx surface at 120/s produce the same KB/s). The per-size table
+   // in the "DMDPROBE SZ" line makes the decomposition an observation instead
+   // of arithmetic.
+   inline void OnIngest(unsigned int width, unsigned int height, unsigned int pixelSize) { if (IsEnabled()) CountIngest(width, height, pixelSize); }
    inline void OnPluginIngest()       { if (IsEnabled()) CountPluginIngest(); }
    inline void OnStage()              { if (IsEnabled()) CountStage(); }
    inline void OnGpuUpload()          { if (IsEnabled()) CountGpuUpload(); }

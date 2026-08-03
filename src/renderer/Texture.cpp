@@ -462,7 +462,7 @@ void BaseTexture::Update(std::shared_ptr<BaseTexture>& tex, const unsigned int w
    // DMDUploadProbe.h). Counted even when image is null: callers that wrote
    // tex->data() directly still trigger the alias clear + SetDirty below, so
    // the GPU re-upload happens all the same.
-   VPX::DMDProbe::OnIngest(static_cast<size_t>(width) * height * pixelSize);
+   VPX::DMDProbe::OnIngest(width, height, static_cast<unsigned int>(pixelSize));
 
    string name;
    if (tex != nullptr)

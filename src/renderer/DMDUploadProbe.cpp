@@ -52,10 +52,45 @@ static void NoteThread(std::atomic<uint64_t>& first, std::atomic<uint32_t>& fore
       foreign.fetch_add(1, std::memory_order_relaxed);
 }
 
-void CountIngest(size_t bytes)
+// Per-size attribution table. The upload streams on a cab are few (a handful
+// of PUP videos, one or two DMD consumers, the odd label), so a small fixed
+// open-addressed table with an overflow bucket covers reality; keys are only
+// ever claimed, never removed, and counts are drained by the 1Hz reader.
+// Sized so the 2026-08-02 workload (6 distinct sizes) fits three times over.
+static constexpr size_t SZ_SLOTS = 16;
+static std::atomic<uint64_t> s_szKey[SZ_SLOTS] {};   // (w<<24 | h<<4 | pixelSize), 0 = free
+static std::atomic<uint32_t> s_szCount[SZ_SLOTS] {}; // drained (exchange 0) at window close
+static std::atomic<uint32_t> s_szOverflow { 0 };
+
+static void CountIngestSize(unsigned int width, unsigned int height, unsigned int pixelSize)
+{
+   const uint64_t key = (static_cast<uint64_t>(width) << 24) | (static_cast<uint64_t>(height) << 4) | pixelSize;
+   for (size_t i = 0; i < SZ_SLOTS; i++)
+   {
+      uint64_t cur = s_szKey[i].load(std::memory_order_relaxed);
+      if (cur == 0)
+      {
+         if (!s_szKey[i].compare_exchange_strong(cur, key, std::memory_order_relaxed))
+         {
+            if (cur != key) // lost the race to a different key: keep probing
+               continue;
+         }
+         cur = key;
+      }
+      if (cur == key)
+      {
+         s_szCount[i].fetch_add(1, std::memory_order_relaxed);
+         return;
+      }
+   }
+   s_szOverflow.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountIngest(unsigned int width, unsigned int height, unsigned int pixelSize)
 {
    s_ingestCount.fetch_add(1, std::memory_order_relaxed);
-   s_ingestBytes.fetch_add(bytes, std::memory_order_relaxed);
+   s_ingestBytes.fetch_add(static_cast<uint64_t>(width) * height * pixelSize, std::memory_order_relaxed);
+   CountIngestSize(width, height, pixelSize);
    NoteThread(s_ingestFirstTid, s_ingestForeign);
 }
 
@@ -99,7 +134,9 @@ void Init()
                "stage = Sampler::UpdateTexture, gpu = bgfx::updateTexture2D, "
                "upf = GPU uploads per rendered frame avg/peak + issuing thread, "
                "xthr = hits from a second thread, "
-               "logic/srcf/quiet/render = frame times ms (srcf = frames where src advanced).";
+               "logic/srcf/quiet/render = frame times ms (srcf = frames where src advanced). "
+               "A second 'DMDPROBE SZ' line breaks ingest down per WxHxBpp:rate:KB/s — "
+               "a bucket at a video's native fps is content, a bucket locked to render fps is waste.";
    }
 }
 
@@ -263,6 +300,52 @@ void OnLogicFrame(const bool srcPresent, const unsigned int srcFrameId, const un
       quietAvgMs, static_cast<double>(s_win.quietFrameUsMax) * 1e-3,
       renderAvgMs, renderMaxMs);
    PLOGI << line;
+
+   // Per-size breakdown: one "SZ" line per window listing every distinct
+   // (width x height x bytes-per-pixel) ingested this second with its rate and
+   // bandwidth share. This is what names the uploader: a 30/s bucket is a
+   // video at its native cadence, a bucket locked to fps is a per-frame
+   // re-upload, and the DMD shows up as 128x32x3 at exactly the chg rate.
+   {
+      struct SzRow { uint64_t key; uint32_t count; };
+      SzRow rows[SZ_SLOTS];
+      size_t n = 0;
+      for (size_t i = 0; i < SZ_SLOTS; i++)
+      {
+         const uint64_t key = s_szKey[i].load(std::memory_order_relaxed);
+         if (key == 0)
+            continue;
+         const uint32_t count = s_szCount[i].exchange(0, std::memory_order_relaxed);
+         if (count > 0 && n < SZ_SLOTS)
+            rows[n++] = { key, count };
+      }
+      const uint32_t szOver = s_szOverflow.exchange(0, std::memory_order_relaxed);
+      if (n > 0 || szOver > 0)
+      {
+         for (size_t i = 1; i < n; i++) // insertion sort by count desc; n is tiny
+         {
+            const SzRow r = rows[i];
+            size_t j = i;
+            for (; j > 0 && rows[j - 1].count < r.count; j--)
+               rows[j] = rows[j - 1];
+            rows[j] = r;
+         }
+         char szLine[640];
+         int pos = snprintf(szLine, sizeof(szLine), "DMDPROBE SZ");
+         for (size_t i = 0; i < n && pos < static_cast<int>(sizeof(szLine)) - 48; i++)
+         {
+            const unsigned int w = static_cast<unsigned int>(rows[i].key >> 24);
+            const unsigned int h = static_cast<unsigned int>((rows[i].key >> 4) & 0xFFFFFu);
+            const unsigned int ps = static_cast<unsigned int>(rows[i].key & 0xFu);
+            pos += snprintf(szLine + pos, sizeof(szLine) - pos, " %ux%ux%u:%.0f/s:%.0fKB/s",
+               w, h, ps, static_cast<double>(rows[i].count) * perSec,
+               static_cast<double>(rows[i].count) * w * h * ps * perSec / 1024.);
+         }
+         if (szOver > 0)
+            pos += snprintf(szLine + pos, sizeof(szLine) - pos, " overflow:%u", szOver);
+         PLOGI << szLine;
+      }
+   }
 
    s_win = Window {};
 }
