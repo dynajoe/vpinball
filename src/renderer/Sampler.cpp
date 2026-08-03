@@ -2,6 +2,7 @@
 
 #include "core/stdafx.h"
 #include "Sampler.h"
+#include "DMDUploadProbe.h"
 #include "RenderDevice.h"
 
 #if defined(ENABLE_BGFX)
@@ -226,6 +227,7 @@ bgfx::TextureHandle Sampler::GetCoreTexture(bool genMipmaps)
          bgfx::updateTexture2D(m_mipsTexture, 0, 0, 0, 0, m_width, m_height, m_textureUpdate);
          m_textureUpdate = nullptr;
          m_pendingMipMapGen = true;
+         VPX::DMDProbe::OnGpuUpload(); // vpinball#3675: actual upload command issued (see DMDUploadProbe.h)
       }
 
       if (!genMipmaps)
@@ -294,6 +296,7 @@ bgfx::TextureHandle Sampler::GetCoreTexture(bool genMipmaps)
          bgfx::updateTexture2D(m_nomipsTexture, 0, 0, 0, 0, m_width, m_height, m_textureUpdate);
          m_textureUpdate = nullptr;
          m_pendingMipMapGen = true;
+         VPX::DMDProbe::OnGpuUpload(); // vpinball#3675: actual upload command issued (see DMDUploadProbe.h)
       }
 
       if (!genMipmaps && bgfx::isValid(m_nomipsTexture))
@@ -352,6 +355,7 @@ bgfx::TextureHandle Sampler::GetCoreTexture(bool genMipmaps)
          bgfx::updateTexture2D(m_mipsTexture, 0, 0, 0, 0, m_width, m_height, m_textureUpdate);
          m_textureUpdate = nullptr;
          m_pendingMipMapGen = true;
+         VPX::DMDProbe::OnGpuUpload(); // vpinball#3675: actual upload command issued (see DMDUploadProbe.h)
 
          if (genMipmaps)
          {
@@ -392,6 +396,10 @@ void Sampler::Unbind()
 void Sampler::UpdateTexture(std::shared_ptr<const BaseTexture> surf, const bool force_linear_rgb)
 {
    m_rd->m_curTextureUpdates++;
+   // vpinball#3675 measurement: a dirty texture actually staged for the GPU
+   // (under BGFX this is a zero-copy makeRef; the upload command is issued in
+   // GetCoreTexture and counted there). See DMDUploadProbe.h.
+   VPX::DMDProbe::OnStage();
 
 #if defined(ENABLE_BGFX)
    const std::lock_guard<std::mutex> lock(m_textureUpdateMutex);

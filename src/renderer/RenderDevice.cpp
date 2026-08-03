@@ -24,6 +24,7 @@
 #endif
 
 #include "RenderDevice.h"
+#include "DMDUploadProbe.h"
 #include "RenderCommand.h"
 #include "Shader.h"
 #include "VRDevice.h"
@@ -2247,6 +2248,12 @@ void RenderDevice::Flip()
    m_curTextureUpdates = 0;
    m_frameLockCalls = m_curLockCalls;
    m_curLockCalls = 0;
+
+   // vpinball#3675 measurement: close the per-rendered-frame upload bucket
+   // here, on the thread that actually issues the frame — deriving "uploads
+   // per rendered frame" from logic frames would assume the 1:1 logic/render
+   // pacing the probe exists to verify. See DMDUploadProbe.h.
+   VPX::DMDProbe::OnRenderFrameFlip();
 
    // Schedule frame presentation (non blocking call, simply queueing the present command in the driver's render queue with a schedule for execution)
    #if defined(ENABLE_BGFX)

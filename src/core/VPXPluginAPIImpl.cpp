@@ -5,6 +5,7 @@
 
 #include "core/VPApp.h"
 #include "parts/flasher.h"
+#include "renderer/DMDUploadProbe.h"
 #include "renderer/Renderer.h"
 #include "ui/live/LiveUI.h"
 
@@ -210,6 +211,12 @@ std::shared_ptr<BaseTexture> VPXPluginAPIImpl::GetTexture(VPXTexture texture) co
 
 void MSGPIAPI VPXPluginAPIImpl::UpdateTexture(VPXTexture* texture, int width, int height, VPXTextureFormat format, const void* image)
 {
+   // Plugin-side share of the ingest counted in BaseTexture::Update: scoreview
+   // (the cab's DMD window), b2s, pup, ... all land here. Counted separately so
+   // the DMDPROBE line can split "plugin windows" from core playfield consumers
+   // — they contend with the playfield on the same bgfx frame either way.
+   VPX::DMDProbe::OnPluginIngest();
+
    VPXTextureBlock** tex = reinterpret_cast<VPXTextureBlock**>(texture);
    if (*tex == nullptr)
       *tex = new VPXTextureBlock();
