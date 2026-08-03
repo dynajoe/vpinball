@@ -3,6 +3,7 @@
 #include "core/stdafx.h"
 #include "Texture.h"
 
+#include "DMDUploadProbe.h"
 #include "math/math.h"
 #include "renderer/Renderer.h"
 #include "ui/win/WinEditor.h"
@@ -454,6 +455,15 @@ std::shared_ptr<BaseTexture> BaseTexture::CreateFromHBitmap(const HBITMAP hbmp, 
 void BaseTexture::Update(std::shared_ptr<BaseTexture>& tex, const unsigned int width, const unsigned int height, const Format texFormat, const void* image)
 {
    const int pixelSize = GetPixelSize(texFormat);
+
+   // Every dynamic (DMD-style) texture funnels through here — flasher/textbox
+   // DMD pulls, script DMDPixels, plugin UpdateTexture — so this is the single
+   // choke point for the "ingest" rate in the vpinball#3675 measurement (see
+   // DMDUploadProbe.h). Counted even when image is null: callers that wrote
+   // tex->data() directly still trigger the alias clear + SetDirty below, so
+   // the GPU re-upload happens all the same.
+   VPX::DMDProbe::OnIngest(static_cast<size_t>(width) * height * pixelSize);
+
    string name;
    if (tex != nullptr)
    {

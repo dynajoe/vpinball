@@ -221,6 +221,8 @@ set(VPX_SOURCES
    src/renderer/trace.h
    src/renderer/Anaglyph.cpp
    src/renderer/Anaglyph.h
+   src/renderer/DMDUploadProbe.cpp
+   src/renderer/DMDUploadProbe.h
    src/renderer/IndexBuffer.cpp
    src/renderer/IndexBuffer.h
    src/renderer/MeshBuffer.cpp

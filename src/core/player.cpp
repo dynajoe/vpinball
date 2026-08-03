@@ -18,6 +18,7 @@
 #include "parts/primitive.h"
 #include "plugins/MsgPlugin.h"
 #include "plugins/VPXPlugin.h"
+#include "renderer/DMDUploadProbe.h"
 #include "renderer/Renderer.h"
 #include "renderer/Shader.h"
 #include "renderer/trace.h"
@@ -207,6 +208,11 @@ Player::Player(PinTable *const table, const PlayMode playMode)
    m_renderProfiler = new FrameProfiler();
    m_renderProfiler->NewFrame(0);
    g_frameProfiler = &m_logicProfiler;
+
+   // vpinball#3675 measurement probe, inert unless VPX_DMD_PROBE=1 is in the
+   // environment (deliberately not an ini key: VPX rewrites the ini on exit,
+   // which is how diagnostics get silently lost or left armed on this cab).
+   VPX::DMDProbe::Init();
 
    // Only show the progress dialog in the not minimized Win32 editor mode
    #ifndef __STANDALONE__
@@ -2110,6 +2116,22 @@ void Player::PrepareFrame()
    #endif
 
    m_logicProfiler.NewFrame(m_time_msec);
+
+   // vpinball#3675 measurement (see renderer/DMDUploadProbe.h). Placed right
+   // after NewFrame so GetPrev() is the just-completed frame the counter
+   // deltas belong to. The poll below is itself a GetRenderFrame pull and can
+   // pay PinMAME's PWM integration for this frame — work an actual consumer
+   // (scoreview, flasher) would otherwise do microseconds later on this same
+   // thread, so the net perturbation is ~zero. Only runs when explicitly
+   // enabled; do not move it inside the PREPARE_FRAME section or its cost
+   // would pollute the very profile it reports.
+   if (VPX::DMDProbe::IsEnabled())
+   {
+      static const string dmdUri = "ctrl://default/display"s;
+      const ResURIResolver::DisplayState dmd = m_resURIResolver.GetDisplayState(dmdUri);
+      VPX::DMDProbe::OnLogicFrame(dmd.source != nullptr, dmd.state.frameId, m_logicProfiler.GetPrev(FrameProfiler::PROFILE_FRAME), m_renderProfiler);
+   }
+
    m_logicProfiler.EnterProfileSection(FrameProfiler::PROFILE_PREPARE_FRAME);
 
    m_overall_frames++; // This causes the next VPinMAME <-> VPX sync to update light status which can be heavy since it needs to perform PWM integration of all lights
