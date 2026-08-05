@@ -514,7 +514,11 @@ public:
    Shader(RenderDevice* renderDevice, const ShaderId id, const bool isStereo);
    ~Shader();
 
-   void Begin();
+   // Begin drawing, applying uniforms from 'commandState' (a render command's
+   // state snapshot) or from m_state when null. Passing the snapshot lets
+   // command execution apply uniforms directly from it, replacing what used to
+   // be a full ShaderState copy into m_state on every draw call.
+   void Begin(class ShaderState* commandState = nullptr);
    void End();
 
    bool HasError() const { return m_hasError; }
@@ -572,6 +576,7 @@ private:
    bool m_hasError = false; // True if loading the shader failed
    unsigned int m_stateSize = 0; // Overall size of a shader state data block
    int m_stateOffsets[static_cast<unsigned int>(ShaderUniform::COUNT)]; // Position of each uniform inside the state data block
+   class ShaderState* m_activeState = nullptr; // State read by Begin/ApplyUniform: the command snapshot during pass execution, m_state otherwise
 
    void Load();
    void ApplyUniform(const ShaderUniform uniformName);
