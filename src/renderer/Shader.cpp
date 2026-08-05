@@ -582,6 +582,8 @@ Shader::Shader(RenderDevice* renderDevice, const ShaderId id, const bool isStere
          }
          m_uniformHandles[i] = bgfx::createUniform(u.name.c_str(), type, n);
       }
+      // Handle idx values may be brand new or recycled: drop any cached values
+      ResetUniformValueCache();
 
    #elif defined(ENABLE_OPENGL)
       memset(m_techniques, 0, sizeof(ShaderTechnique*) * static_cast<unsigned int>(ShaderTechnique::COUNT));
@@ -672,6 +674,8 @@ Shader::~Shader()
          if (bgfx::isValid(m_uniformHandles[i]))
             bgfx::destroy(m_uniformHandles[i]);
       }
+      // The destroyed handles' idx values may be recycled by later createUniform
+      ResetUniformValueCache();
 
    #elif defined(ENABLE_OPENGL)
       for (int j = 0; j < static_cast<unsigned int>(ShaderTechnique::COUNT); ++j)
@@ -1016,6 +1020,54 @@ void Shader::SetBasic(const Material * const mat, Texture * const pin)
    }
 }
 
+#if defined(ENABLE_BGFX)
+// Last value recorded to BGFX for each uniform handle. BGFX retains uniform
+// values across submits and frames (they live in the backend's value store,
+// from which each draw uploads the uniforms its program uses), so re-recording
+// an unchanged value is pure encoder and replay overhead. Without this cache
+// every draw call re-records every uniform of its technique — view matrices,
+// lighting blocks and global flags included — because the memcmp skip in
+// ApplyUniform below is compiled out for BGFX.
+//
+// BGFX interns uniform handles BY NAME: createUniform of the same name from
+// different Shader objects returns the same refcounted handle. The cache is
+// therefore global and keyed by handle idx — a per-shader cache would let one
+// shader's set mask a needed set through another shader sharing the name.
+//
+// Samplers are never cached: texture bindings (bgfx::setTexture) are per-draw
+// state, not retained values.
+//
+// Only the render thread records draws (the invariant the current_shader
+// static already relies on), so no synchronization. Reset whenever a Shader is
+// created or destroyed: handle idx values are recycled by BGFX, and a recycled
+// idx must never inherit the previous owner's bytes.
+namespace
+{
+   vector<vector<uint8_t>> s_bgfxUniformValueCache;
+
+   // Records 'data' as the current value for this handle. Returns false when
+   // the exact bytes were already recorded, i.e. the set can be skipped.
+   bool RecordUniformValue(const uint16_t idx, const void* const data, const size_t size)
+   {
+      if (idx >= s_bgfxUniformValueCache.size())
+         s_bgfxUniformValueCache.resize(idx + 1);
+      vector<uint8_t>& last = s_bgfxUniformValueCache[idx];
+      if (last.size() == size && memcmp(last.data(), data, size) == 0)
+         return false;
+      last.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+      return true;
+   }
+}
+
+void Shader::ResetUniformValueCache() { s_bgfxUniformValueCache.clear(); }
+
+void Shader::SetUniformVec4Cached(const bgfx::UniformHandle handle, const vec4& v)
+{
+   if (RecordUniformValue(handle.idx, &v, sizeof(vec4)))
+      bgfx::setUniform(handle, &v);
+}
+#endif
+
 void Shader::ApplyUniform(const ShaderUniform uniformName)
 {
    assert(static_cast<unsigned int>(uniformName) < static_cast<unsigned int>(ShaderUniform::COUNT));
@@ -1053,6 +1105,13 @@ void Shader::ApplyUniform(const ShaderUniform uniformName)
       return;
       #endif
    }
+   #else
+   // Skip recording values BGFX already holds (see s_bgfxUniformValueCache).
+   // Comparing the source state bytes is enough: the payload put on the wire
+   // below is a pure function of them. Samplers are always re-applied.
+   if ((ShaderUniformDef::coreUniforms[static_cast<unsigned int>(uniformName)].type != ShaderUniformType::Sampler)
+      && !RecordUniformValue(desc.idx, src, ShaderUniformDef::coreUniforms[static_cast<unsigned int>(uniformName)].stateSize))
+      return;
    #endif
    m_renderDevice->m_curParameterChanges++;
 
