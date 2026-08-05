@@ -2,6 +2,9 @@
 
 #include "core/stdafx.h"
 #include "utils/wintimer.h" // FrameProfiler (render-thread frame stats read at 1Hz)
+#include "core/player.h" // PERF line: logic profiler + render device counters
+#include "renderer/Renderer.h" // player.h only forward-declares Renderer; the PERF line walks m_renderer->m_renderDevice
+#include "renderer/RenderDevice.h"
 
 #include "DMDUploadProbe.h"
 
@@ -345,6 +348,38 @@ void OnLogicFrame(const bool srcPresent, const unsigned int srcFrameId, const un
             pos += snprintf(szLine + pos, sizeof(szLine) - pos, " overflow:%u", szOver);
          PLOGI << szLine;
       }
+   }
+
+   // Frame cost breakdown at 1Hz — the A/B metric for BGFX submit-path work.
+   // Logic side: prep = building the render frame (held under m_frameMutex, so
+   // it serializes with the render thread's sub — every ms cut from either
+   // widens the real frame budget). Render side: sub = VPX->BGFX encoding,
+   // flip = bgfx::frame, waitsc = swapchain wait. draws/uni/st/tech are the
+   // render device's last-frame counters; uni (ApplyUniform records) is the
+   // one the uniform-value cache is expected to collapse. Sliding averages and
+   // last-frame counters are written by their own threads and read torn-free
+   // enough for a 1Hz diagnostic — same policy as the render stats above.
+   if (g_pplayer != nullptr && g_pplayer->m_renderer != nullptr && renderProfiler != nullptr)
+   {
+      const RenderDevice* const rd = g_pplayer->m_renderer->m_renderDevice;
+      const FrameProfiler& lp = g_pplayer->m_logicProfiler;
+      char perfLine[512];
+      snprintf(perfLine, sizeof(perfLine),
+         "DMDPROBE PERF draws=%u uni=%u st=%u tech=%u | logic ms: prep %.2f/%.2f phys %.2f script %.2f misc %.2f sleep %.2f | "
+         "render ms: sub %.2f/%.2f flip %.2f waitsc %.2f sleep %.2f",
+         rd->Perf_GetNumDrawCalls(), rd->Perf_GetNumParameterChanges(), rd->Perf_GetNumStateChanges(), rd->Perf_GetNumTechniqueChanges(),
+         static_cast<double>(lp.GetSlidingAvg(FrameProfiler::PROFILE_PREPARE_FRAME)) * 1e-3,
+         static_cast<double>(lp.GetSlidingMax(FrameProfiler::PROFILE_PREPARE_FRAME)) * 1e-3,
+         static_cast<double>(lp.GetSlidingAvg(FrameProfiler::PROFILE_PHYSICS)) * 1e-3,
+         static_cast<double>(lp.GetSlidingAvg(FrameProfiler::PROFILE_SCRIPT)) * 1e-3,
+         static_cast<double>(lp.GetSlidingAvg(FrameProfiler::PROFILE_MISC)) * 1e-3,
+         static_cast<double>(lp.GetSlidingAvg(FrameProfiler::PROFILE_SLEEP)) * 1e-3,
+         static_cast<double>(renderProfiler->GetSlidingAvg(FrameProfiler::PROFILE_RENDER_SUBMIT)) * 1e-3,
+         static_cast<double>(renderProfiler->GetSlidingMax(FrameProfiler::PROFILE_RENDER_SUBMIT)) * 1e-3,
+         static_cast<double>(renderProfiler->GetSlidingAvg(FrameProfiler::PROFILE_RENDER_FLIP)) * 1e-3,
+         static_cast<double>(renderProfiler->GetSlidingAvg(FrameProfiler::PROFILE_RENDER_WAIT_SC)) * 1e-3,
+         static_cast<double>(renderProfiler->GetSlidingAvg(FrameProfiler::PROFILE_RENDER_SLEEP)) * 1e-3);
+      PLOGI << perfLine;
    }
 
    s_win = Window {};
