@@ -525,6 +525,8 @@ public:
    bgfx::ProgramHandle GetCore() const;
    bgfx::UniformHandle GetUniformHandle(ShaderUniform uniformName) const {return m_uniformHandles[static_cast<unsigned int>(uniformName)]; }
    bgfx::ProgramHandle GetProgramHandle(ShaderTechnique techniqueName) const {return m_techniques[static_cast<unsigned int>(techniqueName)]; }
+   // Drops the unchanged-value cache ApplyUniform keeps for BGFX (see Shader.cpp)
+   static void ResetUniformValueCache();
 
 #elif defined(ENABLE_OPENGL)
    class ShaderState* m_boundState[static_cast<unsigned int>(ShaderTechnique::COUNT)]; // The state currently applied to the backend (per technique for OpenGL)
