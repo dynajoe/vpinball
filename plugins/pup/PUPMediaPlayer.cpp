@@ -428,16 +428,18 @@ void PUPMediaPlayer::Render(VPXRenderContext2D* const ctx, const SDL_Rect& destR
 
    if (!selectedFrame.uploaded)
    {
-      // Hand a fresh texture over for each new frame: the previous texture may still be referenced
-      // by a pending GPU upload, so it is released (kept alive by the pending reference until
-      // consumed) instead of being updated in place
+      // The decoder thread already published this frame's pixels into the
+      // slot's persistent texture (see HandleVideoFrame); all that is left on
+      // this — the logic — thread is flagging the texture dirty so the
+      // renderer re-uploads it. That TextureManager touch is the part that
+      // must NOT move off the logic thread. image == nullptr is
+      // BaseTexture::Update's documented "buffer was written in place"
+      // contract: no copy, just alias clear + SetDirty. This used to delete
+      // and recreate the texture with a full copy per video frame, which was
+      // the measured ~3ms prepare-phase spike on every video frame delivery.
       selectedFrame.uploaded = true;
       if (selectedFrame.texture != nullptr)
-      {
-         DeleteTexture(selectedFrame.texture);
-         selectedFrame.texture = nullptr;
-      }
-      UpdateTexture(&selectedFrame.texture, selectedFrame.frame->width, selectedFrame.frame->height, VPXTextureFormat::VPXTEXFMT_sRGBA8, selectedFrame.frame->data[0]);
+         UpdateTexture(&selectedFrame.texture, selectedFrame.frame->width, selectedFrame.frame->height, VPXTextureFormat::VPXTEXFMT_sRGBA8, nullptr);
    }
    if (selectedFrame.texture == nullptr)
       return;
@@ -713,8 +715,10 @@ void PUPMediaPlayer::HandleVideoFrame(AVFrame* frame)
          m_running = false;
          return;
       }
-      // Decode into a slot private buffer: the texture backing store must not be touched as it
-      // may still be referenced by a pending GPU upload
+      // Decode into a slot-private PADDED buffer: sws_scale may write past the
+      // destination (see the ffmpeg tickets above), so it must never target
+      // the unpadded texture buffer directly — the pixels are copied into the
+      // slot's persistent texture right after conversion, still on this thread
       const int bufferSize = m_libAv._av_image_get_buffer_size(targetFormat, targetWidth, targetHeight, 1);
       selectedFrame.buffer = static_cast<uint8_t*>(m_libAv._av_malloc(bufferSize + PUP_SWS_DST_PADDING));
       if (selectedFrame.buffer == nullptr)
@@ -766,6 +770,46 @@ void PUPMediaPlayer::HandleVideoFrame(AVFrame* frame)
          }
          SDL_UnlockSurface(sdlMask);
       }
+   }
+
+   // Publish the converted pixels into the slot's PERSISTENT texture, here on
+   // the decoder thread. This replaces the old render-time hand-off, which
+   // deleted and recreated the texture on the logic thread for every video
+   // frame — a fresh multi-MB allocation whose pages fault during the copy,
+   // measured at ~3ms per delivered frame inside the serialized prepare path
+   // (the cab's dominant frame-time spike; DMDPROBE SPIKE data 2026-08-05).
+   // The convert still targets the padded slot buffer first: sws_scale may
+   // write past the destination (PUP_SWS_DST_PADDING guards two real ffmpeg
+   // overflows), so it must never target the unpadded texture buffer.
+   //
+   // Thread safety, in the order the objections come up:
+   //  - Creation (slot texture still null) only allocates a BaseTexture; the
+   //    TextureManager is not involved until the LOGIC thread flags it dirty
+   //    in Render(), so creating from this thread touches no shared state.
+   //  - Writing the texture's CPU buffer here cannot tear an in-flight GPU
+   //    upload: uploads hold the buffer via bgfx makeRef for at most a couple
+   //    of rendered frames, while a slot is only reclaimed after a full ring
+   //    rotation (3 slots of >=33ms video frames ≈ 12 rendered frames) — and
+   //    Render() cannot select this slot at all while valid == false.
+   //  - The size-change path frees the texture via DeleteTexture, which
+   //    already marshals its work to the main thread.
+   if (selectedFrame.texture == nullptr)
+   {
+      // First frame at this size: create + fill in one call (no shared state)
+      UpdateTexture(&selectedFrame.texture, targetWidth, targetHeight, VPXTextureFormat::VPXTEXFMT_sRGBA8, selectedFrame.frame->data[0]);
+   }
+   else if (const VPXTextureInfo* const texInfo = GetTextureInfo(selectedFrame.texture); texInfo != nullptr && texInfo->data != nullptr)
+   {
+      // Steady state: copy into the texture's tightly-pitched buffer (the slot
+      // buffer may carry per-line sws padding via linesize)
+      const uint8_t* __restrict src = selectedFrame.frame->data[0];
+      uint8_t* __restrict dst = static_cast<uint8_t*>(texInfo->data);
+      const int rowBytes = targetWidth * 4;
+      if (selectedFrame.frame->linesize[0] == rowBytes)
+         memcpy(dst, src, static_cast<size_t>(rowBytes) * targetHeight);
+      else
+         for (int y = 0; y < targetHeight; y++)
+            memcpy(dst + static_cast<size_t>(y) * rowBytes, src + static_cast<size_t>(y) * selectedFrame.frame->linesize[0], rowBytes);
    }
 
    // Update frame information & mark it as valid for selection by the renderer thread
