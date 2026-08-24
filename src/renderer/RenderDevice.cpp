@@ -634,9 +634,12 @@ void RenderDevice::BGFXDesktopRenderLoop(const bgfx::Init& init)
 #endif
 
    // Desktop renderloop, synchronized on main display (playfield window), with game logic preparing frames as soon as possible
+   bool mergeIntoNextFrame = false; // a no-present submission (mid-game static bake) is not a displayed frame: its time is folded into the next one
    while (m_renderDeviceAlive)
    {
-      g_pplayer->m_renderProfiler->NewFrame(g_pplayer->m_time_msec);
+      if (!mergeIntoNextFrame)
+         g_pplayer->m_renderProfiler->NewFrame(g_pplayer->m_time_msec);
+      mergeIntoNextFrame = false;
 
       // wait for a frame to be prepared by the logic thread
       g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_WAIT);
@@ -656,6 +659,9 @@ void RenderDevice::BGFXDesktopRenderLoop(const bgfx::Init& init)
          m_frameNoPresent = false;
          m_framePending = false;
          SubmitAndFlipFrame(false);
+         // not a displayed frame — counting it made the perf overlay read above the frame cap whenever the head-tracking
+         // plugin re-baked the statics (Joe, 2026-08-24: "fps going over 119")
+         mergeIntoNextFrame = true;
          continue;
       }
 
