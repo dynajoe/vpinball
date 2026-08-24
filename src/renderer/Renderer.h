@@ -306,10 +306,9 @@ private:
 
    bool m_isStaticPrepassDirty = true;
    int m_disableStaticPrepass = 0;
-   // Player.StaticPrepassQuickRefresh: after the startup prerender, later prerenders (a plugin re-enabling the prepass
-   // once a head-tracked eye holds still) are a single pass — cheap enough to happen mid-game without a hitch.
+   // Player.StaticPrepassQuickRefresh: every static prerender is a single pass that matches the dynamic frames (no
+   // supersampling, mipmaps kept) — cheap enough to re-bake mid-game when a head-tracking plugin hands the prepass back.
    bool m_staticPrepassQuickRefresh = false;
-   int m_staticPrepassRuns = 0;
    RenderTarget* m_staticPrepassRT = nullptr;
    unsigned int m_statsDrawnStaticTriangles = 0;
    RenderProbe::ReflectionMode m_maxReflectionMode;

@@ -79,6 +79,27 @@ static int    g_stillFrames = 0;
 static bool   g_haveLastApplied = false;
 static float  g_lastX = 0.f, g_lastY = 0.f, g_lastZ = 0.f;
 static long   g_prepassSwitches = 0;
+// Frame pacing, measured where it matters: the interval between consecutive OnPrepareFrame calls. One line per second
+// to stderr — mean, max and how many frames were late (> 1.5x the mean) — with the prepass state, so "ball jitter"
+// can be read off a log instead of argued about at the glass.
+static double g_paceLast = 0.0, g_paceWinStart = 0.0, g_paceSum = 0.0, g_paceMax = 0.0;
+static int    g_paceN = 0, g_paceLate = 0, g_paceOnFrames = 0;
+static void paceTick() {
+   const double t = nowSec();
+   if (g_paceLast > 0.0) {
+      const double dt = (t - g_paceLast) * 1000.0;
+      g_paceSum += dt; g_paceN++; if (dt > g_paceMax) g_paceMax = dt;
+      if (g_paceN > 10 && dt > 1.5 * (g_paceSum / g_paceN)) g_paceLate++;
+      if (!g_prepassOff) g_paceOnFrames++;
+   }
+   g_paceLast = t;
+   if (g_paceWinStart == 0.0) g_paceWinStart = t;
+   if (t - g_paceWinStart >= 1.0 && g_paceN > 0) {
+      fprintf(stderr, "HEADTRACK: pace %d frames avg %.2f ms max %.2f ms late %d | prepass on %d%% of frames (mode %d)\n",
+              g_paceN, g_paceSum / g_paceN, g_paceMax, g_paceLate, 100 * g_paceOnFrames / g_paceN, g_prepassMode); fflush(stderr);
+      g_paceWinStart = t; g_paceSum = 0.0; g_paceMax = 0.0; g_paceN = 0; g_paceLate = 0; g_paceOnFrames = 0;
+   }
+}
 static bool   g_haveApplied = false;
 static float  g_apX = 0.f, g_apY = 0.f, g_apZ = 0.f;
 static time_t g_tuneMtime = 0;
@@ -305,6 +326,7 @@ void onGameEnd(const unsigned int, void*, void*) {
 }
 void onPrepareFrame(const unsigned int, void*, void*) {
    if (!vpxApi) return;
+   paceTick();
    VPXViewSetupDef view; vpxApi->GetActiveViewSetup(&view);
    if (!g_haveBase.exchange(true)) {
       g_baseX = view.viewX; g_baseY = view.viewY; g_baseZ = view.viewZ;

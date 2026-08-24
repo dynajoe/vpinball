@@ -1716,10 +1716,11 @@ void Renderer::RenderStaticPrepass()
    m_staticPrepassRT = GetBackBufferTexture()->Duplicate("StaticPreRender"s);
    assert(!m_staticPrepassRT->IsMSAA());
 
-   // Quick refresh: one pass, no supersampling accumulation, mipmaps kept (so the baked statics match the dynamic frames
-   // they alternate with). Used when the prepass comes back mid-game; the first (startup) prerender keeps full quality.
-   const bool quickRefresh = IsUsingStaticPrepass() && m_staticPrepassQuickRefresh && m_staticPrepassRuns > 0;
-   m_staticPrepassRuns++;
+   // Single-pass prerender (Player.StaticPrepassQuickRefresh): no supersampling accumulation, mipmaps kept. The baked
+   // statics then match the fully dynamic frames pixel for pixel, which matters when a head-tracking plugin alternates
+   // the two many times a minute — a 128-sample, mipmap-free bake would visibly "sharpen" every time the head stops.
+   // It also makes each re-bake cheap enough (one static render) to happen mid-game.
+   const bool quickRefresh = IsUsingStaticPrepass() && m_staticPrepassQuickRefresh;
 
    RenderTarget *accumulationSurface = (IsUsingStaticPrepass() && !quickRefresh) ? m_staticPrepassRT->Duplicate("Accumulation"s) : nullptr;
 
