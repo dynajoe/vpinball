@@ -1728,6 +1728,7 @@ void Renderer::RenderStaticPrepass()
 
    if (IsUsingStaticPrepass())
    {
+      m_staticPrepassBakes++;
       PLOGI << (quickRefresh ? "Performing quick (single pass) prerendering of static parts." : "Performing prerendering of static parts."); // For profiling
       // if rendering static/with heavy oversampling, disable mipmaps & aniso/trilinear filter to get a sharper/more precise result overall!
       ShaderState::m_disableMipmaps = !quickRefresh;

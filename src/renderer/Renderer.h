@@ -309,6 +309,9 @@ private:
    // Player.StaticPrepassQuickRefresh: every static prerender is a single pass that matches the dynamic frames (no
    // supersampling, mipmaps kept) — cheap enough to re-bake mid-game when a head-tracking plugin hands the prepass back.
    bool m_staticPrepassQuickRefresh = false;
+public:
+   int m_staticPrepassBakes = 0;   // static prerenders performed this game (perf overlay shows it next to the mode)
+private:
    RenderTarget* m_staticPrepassRT = nullptr;
    unsigned int m_statsDrawnStaticTriangles = 0;
    RenderProbe::ReflectionMode m_maxReflectionMode;

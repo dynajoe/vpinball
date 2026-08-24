@@ -111,6 +111,18 @@ void PerfUI::RenderFPS()
    }
 
    {
+      // Which rendering mode this frame really used (the renderer's state, not a plugin's intent): with the mostly-static
+      // head-tracking plugin this flips as the eye is held / moved, and the bake count says how often.
+      const bool held = m_player->m_renderer->IsUsingStaticPrepass();
+      const ImVec2 p = ImGui::GetCursorScreenPos();
+      const float r = ImGui::GetTextLineHeight() * 0.35f;
+      ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + r + 2.f * m_uiScale, p.y + ImGui::GetTextLineHeight() * 0.5f), r,
+         held ? IM_COL32(64, 220, 96, 255) : IM_COL32(255, 176, 32, 255));
+      ImGui::Dummy(ImVec2(2.f * r + 6.f * m_uiScale, 0.f)); ImGui::SameLine();
+      ImGui::Text(held ? "STATIC  eye held, statics baked (bake #%d)" : "DYNAMIC  eye moving, full render (bakes %d)", m_player->m_renderer->m_staticPrepassBakes);
+   }
+
+   {
       const ImVec2 inputTextPos = ImGui::GetCursorScreenPos();
       bool hasFlipperLatency = false;
       const uint64_t lastLeftFlipChange = m_player->m_pininput.GetInputActions()[m_player->m_pininput.GetLeftFlipperActionId()]->GetLastStateChange();
