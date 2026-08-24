@@ -567,7 +567,11 @@ void RenderDevice::BGFXOpenXRRenderLoop(const bgfx::Init& init)
             {
                BEGIN_SPAN(tagSpan, "VPX->BGFX")
                std::lock_guard lock(m_frameMutex);
-               g_pplayer->m_renderProfiler->NewFrame(g_pplayer->m_time_msec);
+               // A no-present submission (a mid-game static prerender bake, see Renderer::RenderStaticPrepass) is not a
+               // displayed frame: counting it would shorten the profiler's average and read as "fps above the cap" on the
+               // perf overlay. Its time then lands in the frame that follows, which is the honest place for it.
+               if (!m_frameNoPresent)
+                  g_pplayer->m_renderProfiler->NewFrame(g_pplayer->m_time_msec);
                g_pplayer->m_renderProfiler->EnterProfileSection(FrameProfiler::PROFILE_RENDER_SUBMIT);
                SubmitRenderFrame();
                g_pplayer->m_vrDevice->UpdateVisibilityMask(this);
