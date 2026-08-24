@@ -82,6 +82,7 @@ static long   g_prepassSwitches = 0;
 // Frame pacing, measured where it matters: the interval between consecutive OnPrepareFrame calls. One line per second
 // to stderr — mean, max and how many frames were late (> 1.5x the mean) — with the prepass state, so "ball jitter"
 // can be read off a log instead of argued about at the glass.
+static double nowSec();
 static double g_paceLast = 0.0, g_paceWinStart = 0.0, g_paceSum = 0.0, g_paceMax = 0.0;
 static int    g_paceN = 0, g_paceLate = 0, g_paceOnFrames = 0;
 static void paceTick() {
