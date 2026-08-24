@@ -1722,12 +1722,18 @@ void Renderer::RenderStaticPrepass()
    // bake keeps full quality and, as important, its timing: with a single-pass startup bake "Startup done" arrived
    // seconds earlier and the cab hit a pre-existing RenderThread crash in the NVIDIA driver (libnvidia-glcore
    // +0xdc8b52, also seen 2026-08-02 on the stock build) far more often — 2 of 7 launches vs. rare.
-   const bool quickRefresh = IsUsingStaticPrepass() && m_staticPrepassQuickRefresh && m_staticPrepassBakes > 0;
+   // Mid-game (after the startup bake), every prerender — the quick re-bake when the prepass comes back AND the
+   // background-only refresh of the static target when it goes away (the scene pass always blits that target first,
+   // so it must not keep stale baked statics) — stays inside the frame being prepared, without flush frames.
+   const bool inFrame = m_staticPrepassQuickRefresh && m_staticPrepassBakes > 0;
+   const bool quickRefresh = IsUsingStaticPrepass() && inFrame;
 
    RenderTarget *accumulationSurface = (IsUsingStaticPrepass() && !quickRefresh) ? m_staticPrepassRT->Duplicate("Accumulation"s) : nullptr;
 
    RenderTarget* renderRT = GetAOMode() == 1 ? GetBackBufferTexture() : m_staticPrepassRT;
 
+   if (inFrame && !IsUsingStaticPrepass())
+      PLOGI << "Static target refreshed to background only (prepass released, in-frame).";
    if (IsUsingStaticPrepass())
    {
       m_staticPrepassBakes++;
@@ -1817,7 +1823,7 @@ void Renderer::RenderStaticPrepass()
       // target (AddRenderTargetDependency in RenderFrame), so RenderFrame::Execute orders the bake passes before it.
       // The alternative — a no-present flush frame — is the path that crashes intermittently in bgfx's Vulkan
       // TimerQueryVK::begin on the cab's NVIDIA driver (core 2026-08-24), so mid-game bakes avoid it entirely.
-      if (!quickRefresh)
+      if (!inFrame)
          m_renderDevice->SubmitRenderFrame(); // Submit to avoid stacking up all prerender passes in a huge render frame
    }
 
@@ -1920,13 +1926,13 @@ void Renderer::RenderStaticPrepass()
       m_staticPrepassRT = renderRTmsaa;
       m_renderDevice->AddEndOfFrameCmd([initialPreRender]() { delete initialPreRender; });
    }
-   if (!quickRefresh)
+   if (!inFrame)
       m_renderDevice->SubmitRenderFrame(); // Submit frame as other rendering will not declare a dependency on the created passes and therefore they would be discarded
 
    // Reflection probes keep their startup static prerender across quick re-bakes: PreRenderStatic is a 128-pass loop
    // with a flush per pass — far too heavy (and too many flush frames) for something that happens every time the
    // head stops. Probes in dynamic mode re-render per frame anyway.
-   if (IsUsingStaticPrepass() && !quickRefresh)
+   if (IsUsingStaticPrepass() && !inFrame)
    {
       PLOGI << "Starting Reflection Probe prerendering"; // For profiling
       for (RenderProbe* probe : m_table->m_vrenderprobe)
