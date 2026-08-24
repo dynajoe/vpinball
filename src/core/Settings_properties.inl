@@ -149,6 +149,7 @@ PropEnum(Player, ShowFPS, "Show FPS"s, "Performance overlay display mode"s, int 
 PropBool(Player, SSRefl, "Additive Screen Space Reflection"s, "Add global reflection to the entire scene"s, false);
 PropBool(Player, HDRDisableToneMapper, "Disable tonemapping on HDR display"s, "Do not perform tonemapping when rendering on a high dynamic range (HDR) capable monitor/gfxboard/OS"s, true);
 PropFloat(Player, HDRGlobalExposure, "HDR Display Global Exposure"s, "Global exposure scale multiplier for high dynamic range (HDR) capable monitors"s, 0.f, 5.f, 1.f);
+PropBool(Player, StaticPrepassQuickRefresh, "Quick static prerender refresh"s, "When a plugin hands static prerendering back mid-game (head tracking that holds the eye still), re-render the static parts in a single pass instead of the full multi-pass startup prerender. The startup prerender is unchanged"s, false);
 PropBool(Player, ForceBloomOff, "Disable Bloom"s, "Disable postprocessed bloom filter"s, false);
 PropFloat(Player, BloomStrengthScale, "Bloom Strength"s, "Multiplier on the bloom strength set by the table author. Lower it when bloom washes out the playfield; 0 disables bloom entirely, 1.0 leaves the table as authored"s, 0.f, 2.f, 1.f);
 PropBool(Player, ForceMotionBlurOff, "Disable Motion Blur"s, "Disable ball motion blur.\nThis feature is BGFX only (and not supported in VR or headtracking)"s, false);

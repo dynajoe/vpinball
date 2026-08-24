@@ -63,6 +63,7 @@ Renderer::Renderer(PinTable* const table, VPX::Window* wnd, VideoSyncMode& syncM
    m_ss_refl = m_table->m_settings.GetPlayer_SSRefl();
    m_bloomOff = m_table->m_settings.GetPlayer_ForceBloomOff();
    m_bloomStrengthScale = m_table->m_settings.GetPlayer_BloomStrengthScale();
+   m_staticPrepassQuickRefresh = m_table->m_settings.GetPlayer_StaticPrepassQuickRefresh();
    m_motionBlurOff = m_table->m_settings.GetPlayer_ForceMotionBlurOff();
    m_maxReflectionMode = (RenderProbe::ReflectionMode)m_table->m_settings.GetPlayer_PFReflection();
    m_trailForBalls = m_table->m_settings.GetPlayer_BallTrail();
@@ -1715,15 +1716,20 @@ void Renderer::RenderStaticPrepass()
    m_staticPrepassRT = GetBackBufferTexture()->Duplicate("StaticPreRender"s);
    assert(!m_staticPrepassRT->IsMSAA());
 
-   RenderTarget *accumulationSurface = IsUsingStaticPrepass() ? m_staticPrepassRT->Duplicate("Accumulation"s) : nullptr;
+   // Quick refresh: one pass, no supersampling accumulation, mipmaps kept (so the baked statics match the dynamic frames
+   // they alternate with). Used when the prepass comes back mid-game; the first (startup) prerender keeps full quality.
+   const bool quickRefresh = IsUsingStaticPrepass() && m_staticPrepassQuickRefresh && m_staticPrepassRuns > 0;
+   m_staticPrepassRuns++;
+
+   RenderTarget *accumulationSurface = (IsUsingStaticPrepass() && !quickRefresh) ? m_staticPrepassRT->Duplicate("Accumulation"s) : nullptr;
 
    RenderTarget* renderRT = GetAOMode() == 1 ? GetBackBufferTexture() : m_staticPrepassRT;
 
    if (IsUsingStaticPrepass())
    {
-      PLOGI << "Performing prerendering of static parts."; // For profiling
+      PLOGI << (quickRefresh ? "Performing quick (single pass) prerendering of static parts." : "Performing prerendering of static parts."); // For profiling
       // if rendering static/with heavy oversampling, disable mipmaps & aniso/trilinear filter to get a sharper/more precise result overall!
-      ShaderState::m_disableMipmaps = true;
+      ShaderState::m_disableMipmaps = !quickRefresh;
       #ifdef ENABLE_BGFX
          m_renderDevice->m_DMDShader->SetVector(SHADER_u_basic_shade_mode, 0.f, 0.f, 0.f, 1.f);
       #endif
@@ -1732,7 +1738,7 @@ void Renderer::RenderStaticPrepass()
    //#define STATIC_PRERENDER_ITERATIONS_KOROBOV 7.0 // for the (commented out) lattice-based QMC oversampling, 'magic factor', depending on the number of iterations!
    // loop for X times and accumulate/average these renderings
    // NOTE: iter == 0 MUST ALWAYS PRODUCE an offset of 0,0!
-   int n_iter = IsUsingStaticPrepass() ? (STATIC_PRERENDER_ITERATIONS - 1) : 0;
+   int n_iter = (IsUsingStaticPrepass() && !quickRefresh) ? (STATIC_PRERENDER_ITERATIONS - 1) : 0;
    for (int iter = n_iter; iter >= 0; --iter) // just do one iteration if in dynamic camera/light/material tweaking mode
    {
       #ifdef MSVC_CONCURRENCY_VIEWER
@@ -1740,7 +1746,7 @@ void Renderer::RenderStaticPrepass()
       #endif
 
 #ifdef __LIBVPINBALL__
-      VPinballLib::ProgressData progressData = { (n_iter - iter) * 100 / n_iter };
+      VPinballLib::ProgressData progressData = { n_iter > 0 ? (n_iter - iter) * 100 / n_iter : 100 };
       VPinballLib::VPinballLib::SendEvent(VPINBALL_EVENT_PRERENDERING, &progressData);
 #endif
       m_renderDevice->m_curDrawnTriangles = 0;
@@ -1774,7 +1780,10 @@ void Renderer::RenderStaticPrepass()
          UpdateBasicShaderMatrix();
          for (auto renderable : g_pplayer->m_ptable->GetParts())
             RenderItem(renderable, isNoBackdrop);
+      }
 
+      if (accumulationSurface)
+      {
          // Rendering is done to the static render target then accumulated to accumulationSurface
          // We use the framebuffer mirror shader which copies a weighted version of the bound texture
          m_renderDevice->SetRenderTarget("PreRender Accumulate"s, accumulationSurface);
