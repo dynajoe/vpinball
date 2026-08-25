@@ -198,6 +198,10 @@ static void applyView(VPXViewSetupDef& view) {
    // leaving motion needs a much smaller per-frame step than entering it, so slow drifts don't stair-step
    const bool step = g_haveLastApplied && (g_moving ? dist >= g_holdVpu * 0.25f : dist >= g_holdVpu);
    if (g_haveLastApplied && !step) {
+      // Hold means HOLD: park the render-rate chase on the applied eye too, so when the hold breaks the eye glides from
+      // where it actually is instead of jumping to wherever the chase had drifted. A jump shows up as a ghost copy of the
+      // ball (BGFX ball motion blur/trail reprojects the previous frame) — Joe, 2026-08-24: "a clone of the ball".
+      g_apX = g_lastX; g_apY = g_lastY; g_apZ = g_lastZ;
       if (++g_stillFrames >= g_stillFramesNeeded) {
          g_moving = false;
          if (g_prepassOff) {   // hand the prepass back: VPX re-bakes the statics (one pass) from the held eye
