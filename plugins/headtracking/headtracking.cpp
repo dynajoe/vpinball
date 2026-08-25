@@ -71,7 +71,7 @@ static float  g_v2PredictMs = 60.0f;    // ht-tune.conf: v2_predict_ms — rende
 // The first eye move ≥ hold_vpu takes the prepass away again in the same frame, before anything is drawn, so the two
 // camera views can never be composited together. prepass_mode = 0 is the old behaviour: prepass off for the whole game.
 static int    g_prepassMode = 0;        // ht-tune.conf: prepass_mode (0 = always off, 1 = mostly static)
-static float  g_holdVpu = 2.0f;         // ht-tune.conf: hold_vpu — eye moves smaller than this (≈1 mm) are held, not applied
+static float  g_holdVpu = 6.0f;         // ht-tune.conf: hold_vpu — eye moves smaller than this are held, not applied (0 = off); any prepass_mode
 static int    g_stillFramesNeeded = 8;  // ht-tune.conf: still_frames — held frames before the prepass is handed back
 static bool   g_prepassOff = false;     // we currently hold VPX's DisableStaticPrerendering reference
 static bool   g_moving = false;         // hysteresis: in motion we apply every frame until the per-frame step is tiny
@@ -186,13 +186,12 @@ static void applyView(VPXViewSetupDef& view) {
    g_haveApplied = true;
    view.viewX = g_apX; view.viewY = g_apY; view.viewZ = g_apZ;
 
-   if (g_prepassMode == 0) {
-      // legacy: the prepass stays off for the whole game (taken in onGameStart), apply every frame
-      if (!g_prepassOff) { vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; }
-      vpxApi->SetActiveViewSetup(&view);
-      return;
-   }
-   // mostly static: is this a move worth applying?
+   // prepass_mode 0: the prepass stays off for the whole game; the eye HOLD below still applies (hold_vpu > 0), because
+   // tracker noise — Kinect depth jitter, the shaker motor vibrating the cab and the camera with it — otherwise reaches
+   // the view every frame and reads as choppiness while the player is standing still (Joe, 2026-08-25).
+   if (g_prepassMode == 0 && !g_prepassOff) { vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; }
+   if (g_holdVpu <= 0.f) { vpxApi->SetActiveViewSetup(&view); return; }
+   // is this a move worth applying?
    const float dx = view.viewX - g_lastX, dy = view.viewY - g_lastY, dz = view.viewZ - g_lastZ;
    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
    // leaving motion needs a much smaller per-frame step than entering it, so slow drifts don't stair-step
@@ -204,7 +203,7 @@ static void applyView(VPXViewSetupDef& view) {
       g_apX = g_lastX; g_apY = g_lastY; g_apZ = g_lastZ;
       if (++g_stillFrames >= g_stillFramesNeeded) {
          g_moving = false;
-         if (g_prepassOff) {   // hand the prepass back: VPX re-bakes the statics (one pass) from the held eye
+         if (g_prepassOff && g_prepassMode == 1) {   // hand the prepass back: VPX re-bakes the statics (one pass) from the held eye
             vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; g_prepassSwitches++;
             fprintf(stderr, "HEADTRACK: eye still %d frames -> static prepass ON (switch %ld)\n", g_stillFrames, g_prepassSwitches); fflush(stderr);
          }
@@ -212,7 +211,7 @@ static void applyView(VPXViewSetupDef& view) {
       return;   // hold the eye exactly where it is
    }
    // applying a new eye: the baked statics are now wrong, take the prepass away BEFORE this frame is drawn
-   if (g_haveLastApplied && !g_prepassOff) {
+   if (g_haveLastApplied && !g_prepassOff && g_prepassMode == 1) {
       vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; g_prepassSwitches++;
       fprintf(stderr, "HEADTRACK: eye moved %.1f VPU -> static prepass OFF (switch %ld)\n", dist, g_prepassSwitches); fflush(stderr);
    }
