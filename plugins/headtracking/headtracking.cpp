@@ -6,6 +6,8 @@
 // off-axis "window into the cabinet" perspective. Tracker-agnostic: any source
 // that speaks opentrack UDP (webcam/neuralnet, Kinect, TrackIR, ...) drives it.
 //
+// ht-tune.conf: prepass_mode = 1 keeps VPX's static prerender whenever the eye is held still (hold_vpu, still_frames);
+// needs Player.StaticPrepassQuickRefresh = 1 in our VPX so the re-bake is a single pass.
 // Config via env: HT_UDP_PORT (4242), HT_SIGN_X/Y/Z, HT_ROT_SIGN, HT_LIMIT_VPU (700),\n// HT_ANCHOR (x,y,z cm). Live gain via ~/.config/vpinfe/ht-tune.conf (gain = ...).
 
 #include "plugins/MsgPlugin.h"
@@ -62,6 +64,43 @@ static float  g_gain = 0.175f;   // the settled-by-feel default; 1.0 was 'wildly
 static float  g_renderSmooth = 0.25f;   // per-frame chase toward the target eye (1.0 = raw)
 static int    g_impl = 1;               // ht-tune.conf: impl = 1 (v1 opentrack) | 2 (v2 timestamped)
 static float  g_v2PredictMs = 60.0f;    // ht-tune.conf: v2_predict_ms — render-side dead-reckon horizon
+// "Mostly static" prerendering (ht-tune.conf: prepass_mode = 1). VPX's static prepass is a baked image of the static
+// parts from ONE eye, so it must be off while the eye moves (see onGameStart). But a player stands still most of the
+// time: while the eye is held (no move ≥ hold_vpu for still_frames frames) we hand the prepass back, VPX re-bakes the
+// statics in one pass (Player.StaticPrepassQuickRefresh in our VPX) and then draws only the dynamic parts per frame.
+// The first eye move ≥ hold_vpu takes the prepass away again in the same frame, before anything is drawn, so the two
+// camera views can never be composited together. prepass_mode = 0 is the old behaviour: prepass off for the whole game.
+static int    g_prepassMode = 0;        // ht-tune.conf: prepass_mode (0 = always off, 1 = mostly static)
+static float  g_holdVpu = 6.0f;         // ht-tune.conf: hold_vpu — eye moves smaller than this are held, not applied (0 = off); any prepass_mode
+static int    g_stillFramesNeeded = 8;  // ht-tune.conf: still_frames — held frames before the prepass is handed back
+static bool   g_prepassOff = false;     // we currently hold VPX's DisableStaticPrerendering reference
+static bool   g_moving = false;         // hysteresis: in motion we apply every frame until the per-frame step is tiny
+static int    g_stillFrames = 0;
+static bool   g_haveLastApplied = false;
+static float  g_lastX = 0.f, g_lastY = 0.f, g_lastZ = 0.f;
+static long   g_prepassSwitches = 0;
+// Frame pacing, measured where it matters: the interval between consecutive OnPrepareFrame calls. One line per second
+// to stderr — mean, max and how many frames were late (> 1.5x the mean) — with the prepass state, so "ball jitter"
+// can be read off a log instead of argued about at the glass.
+static double nowSec();
+static double g_paceLast = 0.0, g_paceWinStart = 0.0, g_paceSum = 0.0, g_paceMax = 0.0;
+static int    g_paceN = 0, g_paceLate = 0, g_paceOnFrames = 0;
+static void paceTick() {
+   const double t = nowSec();
+   if (g_paceLast > 0.0) {
+      const double dt = (t - g_paceLast) * 1000.0;
+      g_paceSum += dt; g_paceN++; if (dt > g_paceMax) g_paceMax = dt;
+      if (g_paceN > 10 && dt > 1.5 * (g_paceSum / g_paceN)) g_paceLate++;
+      if (!g_prepassOff) g_paceOnFrames++;
+   }
+   g_paceLast = t;
+   if (g_paceWinStart == 0.0) g_paceWinStart = t;
+   if (t - g_paceWinStart >= 1.0 && g_paceN > 0) {
+      fprintf(stderr, "HEADTRACK: pace %d frames avg %.2f ms max %.2f ms late %d | prepass on %d%% of frames (mode %d)\n",
+              g_paceN, g_paceSum / g_paceN, g_paceMax, g_paceLate, 100 * g_paceOnFrames / g_paceN, g_prepassMode); fflush(stderr);
+      g_paceWinStart = t; g_paceSum = 0.0; g_paceMax = 0.0; g_paceN = 0; g_paceLate = 0; g_paceOnFrames = 0;
+   }
+}
 static bool   g_haveApplied = false;
 static float  g_apX = 0.f, g_apY = 0.f, g_apZ = 0.f;
 static time_t g_tuneMtime = 0;
@@ -106,6 +145,18 @@ static void reloadTune() {
          if (!(v >= 0.0f && v <= 150.0f)) continue;
          g_v2PredictMs = v;
       }
+      if (sscanf(line, " prepass_mode = %f", &v) == 1 || sscanf(line, " prepass_mode=%f", &v) == 1) {
+         const int m = (v >= 0.5f) ? 1 : 0;
+         if (m != g_prepassMode) { g_prepassMode = m; fprintf(stderr, "HEADTRACK: prepass_mode -> %d\n", m); fflush(stderr); }
+      }
+      if (sscanf(line, " hold_vpu = %f", &v) == 1 || sscanf(line, " hold_vpu=%f", &v) == 1) {
+         if (!(v >= 0.0f && v <= 50.0f)) continue;
+         g_holdVpu = v;
+      }
+      if (sscanf(line, " still_frames = %f", &v) == 1 || sscanf(line, " still_frames=%f", &v) == 1) {
+         if (!(v >= 1.0f && v <= 600.0f)) continue;
+         g_stillFramesNeeded = (int)v;
+      }
    }
    fclose(f);
 }
@@ -134,6 +185,38 @@ static void applyView(VPXViewSetupDef& view) {
    }
    g_haveApplied = true;
    view.viewX = g_apX; view.viewY = g_apY; view.viewZ = g_apZ;
+
+   // prepass_mode 0: the prepass stays off for the whole game; the eye HOLD below still applies (hold_vpu > 0), because
+   // tracker noise — Kinect depth jitter, the shaker motor vibrating the cab and the camera with it — otherwise reaches
+   // the view every frame and reads as choppiness while the player is standing still (Joe, 2026-08-25).
+   if (g_prepassMode == 0 && !g_prepassOff) { vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; }
+   if (g_holdVpu <= 0.f) { vpxApi->SetActiveViewSetup(&view); return; }
+   // is this a move worth applying?
+   const float dx = view.viewX - g_lastX, dy = view.viewY - g_lastY, dz = view.viewZ - g_lastZ;
+   const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+   // leaving motion needs a much smaller per-frame step than entering it, so slow drifts don't stair-step
+   const bool step = g_haveLastApplied && (g_moving ? dist >= g_holdVpu * 0.25f : dist >= g_holdVpu);
+   if (g_haveLastApplied && !step) {
+      // Hold means HOLD: park the render-rate chase on the applied eye too, so when the hold breaks the eye glides from
+      // where it actually is instead of jumping to wherever the chase had drifted. A jump shows up as a ghost copy of the
+      // ball (BGFX ball motion blur/trail reprojects the previous frame) — Joe, 2026-08-24: "a clone of the ball".
+      g_apX = g_lastX; g_apY = g_lastY; g_apZ = g_lastZ;
+      if (++g_stillFrames >= g_stillFramesNeeded) {
+         g_moving = false;
+         if (g_prepassOff && g_prepassMode == 1) {   // hand the prepass back: VPX re-bakes the statics (one pass) from the held eye
+            vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; g_prepassSwitches++;
+            fprintf(stderr, "HEADTRACK: eye still %d frames -> static prepass ON (switch %ld)\n", g_stillFrames, g_prepassSwitches); fflush(stderr);
+         }
+      }
+      return;   // hold the eye exactly where it is
+   }
+   // applying a new eye: the baked statics are now wrong, take the prepass away BEFORE this frame is drawn
+   if (g_haveLastApplied && !g_prepassOff && g_prepassMode == 1) {
+      vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; g_prepassSwitches++;
+      fprintf(stderr, "HEADTRACK: eye moved %.1f VPU -> static prepass OFF (switch %ld)\n", dist, g_prepassSwitches); fflush(stderr);
+   }
+   g_moving = g_haveLastApplied; g_stillFrames = 0;
+   g_lastX = view.viewX; g_lastY = view.viewY; g_lastZ = view.viewZ; g_haveLastApplied = true;
    vpxApi->SetActiveViewSetup(&view);
 }
 
@@ -227,12 +310,15 @@ void onGameStart(const unsigned int, void*, void*) {
       // and the two disagree — the playfield visibly separates from the objects sitting on
       // it and flashes, on every table. VPX's own point-of-view page does exactly this for
       // as long as its camera is being dragged.
-      vpxApi->DisableStaticPrerendering(1);
-      vpxApi->PushNotification("Head tracking active", 3000);
+      // prepass_mode 1 ("mostly static") takes it only while the eye is actually moving — see applyView.
+      g_prepassOff = false; g_moving = false; g_stillFrames = 0; g_haveLastApplied = false;
+      reloadTune();
+      if (g_prepassMode == 0) { vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; }
+      vpxApi->PushNotification(g_prepassMode == 0 ? "Head tracking active" : "Head tracking active (mostly static)", 3000);
    }
 }
 void onGameEnd(const unsigned int, void*, void*) {
-   if (vpxApi) vpxApi->DisableStaticPrerendering(0);   // refcounted — give it back
+   if (vpxApi && g_prepassOff) { vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; }   // refcounted — give it back
    if (g_running.exchange(false)) {
       if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR);   // unblocks recv
       if (g_sock2 >= 0) shutdown(g_sock2, SHUT_RDWR);
@@ -244,6 +330,7 @@ void onGameEnd(const unsigned int, void*, void*) {
 }
 void onPrepareFrame(const unsigned int, void*, void*) {
    if (!vpxApi) return;
+   paceTick();
    VPXViewSetupDef view; vpxApi->GetActiveViewSetup(&view);
    if (!g_haveBase.exchange(true)) {
       g_baseX = view.viewX; g_baseY = view.viewY; g_baseZ = view.viewZ;
@@ -471,7 +558,7 @@ MSGPI_EXPORT void MSGPIAPI HeadTrackingPluginLoad(const uint32_t sessionId, cons
 MSGPI_EXPORT void MSGPIAPI HeadTrackingPluginUnload() {
    // If a game is still running (unload without onGameEnd), give back the
    // static-prepass reference or it stays disabled for the rest of the game.
-   if (g_running.load() && vpxApi) vpxApi->DisableStaticPrerendering(0);
+   if (g_running.load() && vpxApi && g_prepassOff) { vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; }
    if (g_running.exchange(false)) { if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR); if (g_udpThread.joinable()) g_udpThread.join(); }
    msgApi->UnsubscribeMsg(onGameStartId, onGameStart, nullptr);
    msgApi->UnsubscribeMsg(onGameEndId, onGameEnd, nullptr);
