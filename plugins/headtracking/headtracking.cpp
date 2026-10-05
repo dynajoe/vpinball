@@ -70,6 +70,9 @@ static float  g_v2PredictMs = 60.0f;    // ht-tune.conf: v2_predict_ms — rende
 // statics in one pass (Player.StaticPrepassQuickRefresh in our VPX) and then draws only the dynamic parts per frame.
 // The first eye move ≥ hold_vpu takes the prepass away again in the same frame, before anything is drawn, so the two
 // camera views can never be composited together. prepass_mode = 0 is the old behaviour: prepass off for the whole game.
+static bool   g_enabled = true;         // ht-tune.conf: enabled = 0 renders as if the plugin were not loaded (A/B frame times)
+static int    g_fileEnabled = -1;       // last `enabled` value read from ht-tune.conf (-1 = not read yet)
+static float  g_toggleHoldS = 1.0f;     // ht-tune.conf: toggle_hold_ms — hold both magna saves this long to flip g_enabled (0 = off)
 static int    g_prepassMode = 0;        // ht-tune.conf: prepass_mode (0 = always off, 1 = mostly static)
 static float  g_holdVpu = 6.0f;         // ht-tune.conf: hold_vpu — eye moves smaller than this are held, not applied (0 = off); any prepass_mode
 static int    g_stillFramesNeeded = 8;  // ht-tune.conf: still_frames — held frames before the prepass is handed back
@@ -145,6 +148,19 @@ static void reloadTune() {
          if (!(v >= 0.0f && v <= 150.0f)) continue;
          g_v2PredictMs = v;
       }
+      if (sscanf(line, " enabled = %f", &v) == 1 || sscanf(line, " enabled=%f", &v) == 1) {
+         // only an EDIT of the enabled line counts: any other live edit (gain, ...) re-parses the whole file and must not
+         // undo a magna save toggle in the middle of an A/B run
+         const int e = v >= 0.5f ? 1 : 0;
+         if (e != g_fileEnabled) {
+            g_fileEnabled = e;
+            if ((e != 0) != g_enabled) { g_enabled = e != 0; fprintf(stderr, "HEADTRACK: enabled -> %d\n", e); fflush(stderr); }
+         }
+      }
+      if (sscanf(line, " toggle_hold_ms = %f", &v) == 1 || sscanf(line, " toggle_hold_ms=%f", &v) == 1) {
+         if (!(v >= 0.0f && v <= 10000.0f)) continue;
+         g_toggleHoldS = v * 0.001f;
+      }
       if (sscanf(line, " prepass_mode = %f", &v) == 1 || sscanf(line, " prepass_mode=%f", &v) == 1) {
          const int m = (v >= 0.5f) ? 1 : 0;
          if (m != g_prepassMode) { g_prepassMode = m; fprintf(stderr, "HEADTRACK: prepass_mode -> %d\n", m); fflush(stderr); }
@@ -175,49 +191,72 @@ static double nowSec() {
 // ht-tune.conf (1.0 = raw). The ~30ms of added lag hides inside the tracker's
 // existing 60ms forward prediction.
 static void applyView(VPXViewSetupDef& view) {
-   if (g_haveApplied && g_renderSmooth < 0.999f) {
-      const float k = clampf(g_renderSmooth, 0.05f, 1.0f);
-      g_apX += (view.viewX - g_apX) * k;
-      g_apY += (view.viewY - g_apY) * k;
-      g_apZ += (view.viewZ - g_apZ) * k;
-   } else {
-      g_apX = view.viewX; g_apY = view.viewY; g_apZ = view.viewZ;
-   }
-   g_haveApplied = true;
-   view.viewX = g_apX; view.viewY = g_apY; view.viewZ = g_apZ;
-
    // prepass_mode 0: the prepass stays off for the whole game; the eye HOLD below still applies (hold_vpu > 0), because
    // tracker noise — Kinect depth jitter, the shaker motor vibrating the cab and the camera with it — otherwise reaches
    // the view every frame and reads as choppiness while the player is standing still (Joe, 2026-08-25).
    if (g_prepassMode == 0 && !g_prepassOff) { vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; }
-   if (g_holdVpu <= 0.f) { vpxApi->SetActiveViewSetup(&view); return; }
-   // is this a move worth applying?
-   const float dx = view.viewX - g_lastX, dy = view.viewY - g_lastY, dz = view.viewZ - g_lastZ;
-   const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-   // leaving motion needs a much smaller per-frame step than entering it, so slow drifts don't stair-step
-   const bool step = g_haveLastApplied && (g_moving ? dist >= g_holdVpu * 0.25f : dist >= g_holdVpu);
-   if (g_haveLastApplied && !step) {
-      // Hold means HOLD: park the render-rate chase on the applied eye too, so when the hold breaks the eye glides from
-      // where it actually is instead of jumping to wherever the chase had drifted. A jump shows up as a ghost copy of the
-      // ball (BGFX ball motion blur/trail reprojects the previous frame) — Joe, 2026-08-24: "a clone of the ball".
-      g_apX = g_lastX; g_apY = g_lastY; g_apZ = g_lastZ;
-      if (++g_stillFrames >= g_stillFramesNeeded) {
-         g_moving = false;
-         if (g_prepassOff && g_prepassMode == 1) {   // hand the prepass back: VPX re-bakes the statics (one pass) from the held eye
-            vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; g_prepassSwitches++;
-            fprintf(stderr, "HEADTRACK: eye still %d frames -> static prepass ON (switch %ld)\n", g_stillFrames, g_prepassSwitches); fflush(stderr);
+
+   // HOLD: decide on the RAW target eye, then let the render-rate chase glide toward whichever eye wins (the held one or
+   // the new one). Deciding on the chased eye, as this used to, multiplied the threshold by 1/render_smooth — at
+   // render_smooth 0.1 a 6 VPU hold needed ~60 VPU of head travel and then snapped to catch up: "I need to move a
+   // significant amount for it to start moving ... then it jumps to my viewpoint" (Joe, 2026-10-04).
+   float tx = view.viewX, ty = view.viewY, tz = view.viewZ;
+   if (g_holdVpu > 0.f) {
+      const float dx = tx - g_lastX, dy = ty - g_lastY, dz = tz - g_lastZ;
+      const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+      // leaving motion needs a much smaller step than entering it, so slow drifts don't stair-step
+      const bool step = !g_haveLastApplied || (g_moving ? dist >= g_holdVpu * 0.25f : dist >= g_holdVpu);
+      if (step) {
+         // a new eye: the baked statics are now wrong, take the prepass away BEFORE this frame is drawn
+         if (g_haveLastApplied && !g_prepassOff && g_prepassMode == 1) {
+            vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; g_prepassSwitches++;
+            fprintf(stderr, "HEADTRACK: eye moved %.1f VPU -> static prepass OFF (switch %ld)\n", dist, g_prepassSwitches); fflush(stderr);
          }
+         g_moving = g_haveLastApplied; g_stillFrames = 0;
+         g_lastX = tx; g_lastY = ty; g_lastZ = tz; g_haveLastApplied = true;
+      } else {
+         if (++g_stillFrames >= g_stillFramesNeeded) g_moving = false;
+         tx = g_lastX; ty = g_lastY; tz = g_lastZ;   // hold means HOLD: the chase settles on the held eye, no drift
       }
-      return;   // hold the eye exactly where it is
    }
-   // applying a new eye: the baked statics are now wrong, take the prepass away BEFORE this frame is drawn
-   if (g_haveLastApplied && !g_prepassOff && g_prepassMode == 1) {
-      vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; g_prepassSwitches++;
-      fprintf(stderr, "HEADTRACK: eye moved %.1f VPU -> static prepass OFF (switch %ld)\n", dist, g_prepassSwitches); fflush(stderr);
+
+   // render-rate chase toward the target, gliding from where the eye actually is — a jump shows up as a ghost copy of
+   // the ball (BGFX ball motion blur/trail reprojects the previous frame) — Joe, 2026-08-24: "a clone of the ball".
+   // render_smooth is the fraction covered per frame AT 120 FPS (what it was tuned at on the cab); scale it by the real
+   // frame time so the lag stays the same when the frame rate drops — a per-frame fraction doubled it at 60 fps.
+   static double s_lastT = 0.0;
+   const double now = nowSec();
+   const double dt = s_lastT > 0.0 ? std::min(std::max(now - s_lastT, 0.0), 0.1) : 1.0 / 120.0;
+   s_lastT = now;
+   const bool first = !g_haveApplied;
+   if (!first && g_renderSmooth < 0.999f) {
+      const float k = 1.0f - (float)std::pow(1.0 - clampf(g_renderSmooth, 0.05f, 1.0f), dt * 120.0);
+      g_apX += (tx - g_apX) * k;
+      g_apY += (ty - g_apY) * k;
+      g_apZ += (tz - g_apZ) * k;
+      // snap the asymptotic tail so a held eye really stops changing (and the prepass can come back)
+      if (std::fabs(tx - g_apX) < 0.05f && std::fabs(ty - g_apY) < 0.05f && std::fabs(tz - g_apZ) < 0.05f) {
+         g_apX = tx; g_apY = ty; g_apZ = tz;
+      }
+   } else {
+      g_apX = tx; g_apY = ty; g_apZ = tz;
    }
-   g_moving = g_haveLastApplied; g_stillFrames = 0;
-   g_lastX = view.viewX; g_lastY = view.viewY; g_lastZ = view.viewZ; g_haveLastApplied = true;
-   vpxApi->SetActiveViewSetup(&view);
+   g_haveApplied = true;
+   const bool settled = g_apX == tx && g_apY == ty && g_apZ == tz;
+
+   // hand the prepass back only once the held eye is reached: VPX re-bakes the statics (one pass) from that eye
+   if (g_holdVpu > 0.f && !g_moving && settled && g_prepassOff && g_prepassMode == 1) {
+      vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; g_prepassSwitches++;
+      fprintf(stderr, "HEADTRACK: eye still %d frames -> static prepass ON (switch %ld)\n", g_stillFrames, g_prepassSwitches); fflush(stderr);
+   }
+
+   // a held, settled eye is left alone: VPX keeps the active view, exactly as before
+   static float s_setX = 0.f, s_setY = 0.f, s_setZ = 0.f;
+   if (first || g_apX != s_setX || g_apY != s_setY || g_apZ != s_setZ) {
+      view.viewX = g_apX; view.viewY = g_apY; view.viewZ = g_apZ;
+      vpxApi->SetActiveViewSetup(&view);
+      s_setX = g_apX; s_setY = g_apY; s_setZ = g_apZ;
+   }
 }
 
 // ----- v2 experiment: timestamped anchor-relative deltas on port+1 (4243) -----
@@ -292,6 +331,19 @@ static void udpListener() {
    // a reused fd number could get shutdown() from under another VPX subsystem.
 }
 
+// Stop and join BOTH listeners, keyed on joinable() rather than g_running: a failed bind clears g_running itself, and
+// gating the joins on it left a finished-but-joinable std::thread that the next game start (in-place table switch)
+// assigned over — std::terminate.
+static void stopListeners() {
+   g_running.store(false);
+   if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR);   // unblocks recv
+   if (g_sock2 >= 0) shutdown(g_sock2, SHUT_RDWR);
+   if (g_udpThread.joinable()) g_udpThread.join();
+   if (g_udpThread2.joinable()) g_udpThread2.join();
+   if (g_sock >= 0) { close(g_sock); g_sock = -1; }   // close only after join
+   if (g_sock2 >= 0) { close(g_sock2); g_sock2 = -1; }
+}
+
 void onGameStart(const unsigned int, void*, void*) {
    g_haveBase.store(false); g_frames = 0; g_poseTime = 0.0;
    g_haveApplied = false;   // no cross-table glide from a stale smoothed eye
@@ -299,7 +351,9 @@ void onGameStart(const unsigned int, void*, void*) {
    // previous table's sign and zOffset and took the absolute path with a foreign
    // transform — instead of the intended hold-base fallback.
    g_rotSign = 0.f; g_zOffset = 0.f; g_tableLength = 2000.f;
-   if (!g_running.exchange(true)) {
+   if (!g_running.load()) {
+      stopListeners();   // reap listeners that died on a failed bind
+      g_running.store(true);
       g_udpThread = std::thread(udpListener);
       g_udpThread2 = std::thread(udpListenerV2);
    }
@@ -319,18 +373,32 @@ void onGameStart(const unsigned int, void*, void*) {
 }
 void onGameEnd(const unsigned int, void*, void*) {
    if (vpxApi && g_prepassOff) { vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; }   // refcounted — give it back
-   if (g_running.exchange(false)) {
-      if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR);   // unblocks recv
-      if (g_sock2 >= 0) shutdown(g_sock2, SHUT_RDWR);
-      if (g_udpThread.joinable()) g_udpThread.join();
-      if (g_udpThread2.joinable()) g_udpThread2.join();
-      if (g_sock >= 0) { close(g_sock); g_sock = -1; }   // close only after join
-      if (g_sock2 >= 0) { close(g_sock2); g_sock2 = -1; }
+   stopListeners();
+}
+// Holding both magna saves for toggle_hold_ms flips head tracking on/off mid-game, so frame times can be compared at the
+// glass without touching ht-tune.conf. Polled (GetInputState maps VPXAction properly; OnActionChanged carries VPX's
+// internal action ids). One flip per hold: both buttons must be released before the next one counts.
+static void pollToggleCombo() {
+   static double s_heldSince = 0.0;
+   static bool   s_fired = false;
+   VPXInputState in{};
+   in.actionMask = (1ULL << VPXACTION_LeftMagnaSave) | (1ULL << VPXACTION_RightMagnaSave);
+   vpxApi->GetInputState(&in);
+   const bool held = g_toggleHoldS > 0.f && in.actionMask == in.actionState && in.actionMask != 0;
+   if (!held) { s_heldSince = 0.0; s_fired = false; return; }
+   const double t = nowSec();
+   if (s_heldSince == 0.0) s_heldSince = t;
+   if (!s_fired && t - s_heldSince >= g_toggleHoldS) {
+      s_fired = true;
+      g_enabled = !g_enabled;
+      fprintf(stderr, "HEADTRACK: enabled -> %d (magna save combo)\n", g_enabled ? 1 : 0); fflush(stderr);
+      vpxApi->PushNotification(g_enabled ? "Head tracking ON" : "Head tracking OFF", 2000);
    }
 }
 void onPrepareFrame(const unsigned int, void*, void*) {
    if (!vpxApi) return;
    paceTick();
+   pollToggleCombo();
    VPXViewSetupDef view; vpxApi->GetActiveViewSetup(&view);
    if (!g_haveBase.exchange(true)) {
       g_baseX = view.viewX; g_baseY = view.viewY; g_baseZ = view.viewZ;
@@ -371,6 +439,20 @@ void onPrepareFrame(const unsigned int, void*, void*) {
                  anch ? anch : "unset", g_baseX, g_baseY, g_baseZ);
       fflush(stderr);
    }
+   // enabled = 0: hand the static prepass back and put the eye back on the table's own view, so VPX renders exactly as
+   // without the plugin. The pace log keeps running, giving on/off frame times in the same log for the same table.
+   if (!g_enabled) {
+      if ((g_frames++ % 20) == 0) reloadTune();
+      if (g_prepassOff) { vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; }
+      if (g_haveApplied) {
+         view.viewX = g_baseX; view.viewY = g_baseY; view.viewZ = g_baseZ;
+         vpxApi->SetActiveViewSetup(&view);
+         g_haveApplied = false; g_haveLastApplied = false; g_moving = false; g_stillFrames = 0;
+      }
+      return;
+   }
+   if (g_prepassMode == 0 && !g_prepassOff) { vpxApi->DisableStaticPrerendering(1); g_prepassOff = true; }
+
    double p[6]; double age;
    { std::lock_guard<std::mutex> lk(g_poseMtx); memcpy(p, g_pose, sizeof(p)); age = nowSec() - g_poseTime; }
 
@@ -559,7 +641,7 @@ MSGPI_EXPORT void MSGPIAPI HeadTrackingPluginUnload() {
    // If a game is still running (unload without onGameEnd), give back the
    // static-prepass reference or it stays disabled for the rest of the game.
    if (g_running.load() && vpxApi && g_prepassOff) { vpxApi->DisableStaticPrerendering(0); g_prepassOff = false; }
-   if (g_running.exchange(false)) { if (g_sock >= 0) shutdown(g_sock, SHUT_RDWR); if (g_udpThread.joinable()) g_udpThread.join(); }
+   stopListeners();
    msgApi->UnsubscribeMsg(onGameStartId, onGameStart, nullptr);
    msgApi->UnsubscribeMsg(onGameEndId, onGameEnd, nullptr);
    msgApi->UnsubscribeMsg(onPrepareFrameId, onPrepareFrame, nullptr);
