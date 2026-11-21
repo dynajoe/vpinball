@@ -165,6 +165,8 @@ public:
    RenderTarget* GetPostProcessRenderTarget1();
    RenderTarget* GetPostProcessRenderTarget2();
    RenderTarget* GetPostProcessRenderTarget3(); // Third post process buffer (SMAA): the previous back buffer when it has the post process size
+   RenderTarget* GetSMAAEdgeRenderTarget(); // SMAA edges, with the depth buffer used to mask the blend weight pass to the edge pixels
+   RenderTarget* GetSMAAWeightRenderTarget(); // SMAA blend weights, sharing the depth buffer of the edge target
    RenderTarget* GetPostProcessRenderTarget(RenderTarget* renderedRT);
 
    RenderTarget* GetReflectionBufferTexture();
@@ -272,6 +274,8 @@ private:
    RenderTarget* m_pPostProcessRenderTarget1 = nullptr;
    RenderTarget* m_pPostProcessRenderTarget2 = nullptr;
    RenderTarget* m_pPostProcessRenderTarget3 = nullptr;
+   RenderTarget* m_pSMAAEdgeRenderTarget = nullptr;
+   RenderTarget* m_pSMAAWeightRenderTarget = nullptr;
 
    RenderTarget* m_pReflectionBufferTexture = nullptr;
 
