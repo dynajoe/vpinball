@@ -398,6 +398,79 @@ private:
 };
 #endif
 
+// ---------------------------------------------------------------------------------------------
+// PERF PROBE (measurement builds only, never carried on cab-release).
+// VPX_PERFPROBE=<seconds> turns on BGFX's per-view profiler and prints, every <seconds>, the
+// average GPU and CPU-submit time of the frame and of every view (= VPX render pass), plus the
+// frame profiler sections of both threads. One block per period on stderr, prefixed PERFPROBE.
+static int PerfProbePeriod()
+{
+   static const int period = [] { const char* const v = getenv("VPX_PERFPROBE"); return v ? atoi(v) : 0; }();
+   return period;
+}
+
+static void PerfProbeOnFrame(const bgfx::Stats* const stats)
+{
+   if (PerfProbePeriod() <= 0 || stats == nullptr)
+      return;
+   struct ViewAcc { double gpu = 0., cpu = 0.; uint64_t n = 0; uint32_t order = 0; };
+   static ankerl::unordered_dense::map<string, ViewAcc> views;
+   static uint64_t winStart = 0, frames = 0;
+   static double gpuFrame = 0., cpuSubmit = 0., waitSubmit = 0., waitRender = 0.;
+   static uint64_t numDraw = 0, numCompute = 0, numBlit = 0, numViews = 0;
+   static uint32_t lastGpuFrame = 0xFFFFFFFFu;
+   const uint64_t now = usec();
+   if (winStart == 0)
+      winStart = now;
+   if (stats->gpuFrameNum != lastGpuFrame)
+   {
+      lastGpuFrame = stats->gpuFrameNum;
+      frames++;
+      gpuFrame += static_cast<double>(stats->gpuTimeEnd - stats->gpuTimeBegin) * 1000. / static_cast<double>(stats->gpuTimerFreq);
+      cpuSubmit += static_cast<double>(stats->cpuTimeEnd - stats->cpuTimeBegin) * 1000. / static_cast<double>(stats->cpuTimerFreq);
+      waitSubmit += static_cast<double>(stats->waitSubmit) * 1000. / static_cast<double>(stats->cpuTimerFreq);
+      waitRender += static_cast<double>(stats->waitRender) * 1000. / static_cast<double>(stats->cpuTimerFreq);
+      numDraw += stats->numDraw; numCompute += stats->numCompute; numBlit += stats->numBlit; numViews += stats->numViews;
+      for (uint16_t i = 0; i < stats->numViews; i++)
+      {
+         const bgfx::ViewStats& vs = stats->viewStats[i];
+         ViewAcc& acc = views[vs.name];
+         if (acc.n == 0)
+            acc.order = static_cast<uint32_t>(views.size());
+         acc.gpu += static_cast<double>(vs.gpuTimeEnd - vs.gpuTimeBegin) * 1000. / static_cast<double>(stats->gpuTimerFreq);
+         acc.cpu += static_cast<double>(vs.cpuTimeEnd - vs.cpuTimeBegin) * 1000. / static_cast<double>(stats->cpuTimerFreq);
+         acc.n++;
+      }
+   }
+   if (now - winStart < static_cast<uint64_t>(PerfProbePeriod()) * 1000000ull || frames == 0)
+      return;
+   const double f = static_cast<double>(frames);
+   const double secs = static_cast<double>(now - winStart) * 1e-6;
+   fprintf(stderr, "PERFPROBE: frames %llu in %.2fs (%.2f fps) | gpuFrame %.3f ms | bgfxSubmit %.3f ms | waitSubmit %.3f ms waitRender %.3f ms | draws %.0f blits %.0f views %.0f\n",
+      static_cast<unsigned long long>(frames), secs, f / secs, gpuFrame / f, cpuSubmit / f, waitSubmit / f, waitRender / f, static_cast<double>(numDraw) / f,
+      static_cast<double>(numBlit) / f, static_cast<double>(numViews) / f);
+   if (g_pplayer)
+   {
+      const FrameProfiler& lp = g_pplayer->m_logicProfiler;
+      const FrameProfiler& rp = *g_pplayer->m_renderProfiler;
+      fprintf(stderr, "PERFPROBE: logic  frame %.3f | prepare %.3f script %.3f physics %.3f misc %.3f sleep %.3f c1 %.3f c2 %.3f c3 %.3f ms\n", lp.GetSlidingAvg(FrameProfiler::PROFILE_FRAME) * 1e-3,
+         lp.GetSlidingAvg(FrameProfiler::PROFILE_PREPARE_FRAME) * 1e-3, lp.GetSlidingAvg(FrameProfiler::PROFILE_SCRIPT) * 1e-3, lp.GetSlidingAvg(FrameProfiler::PROFILE_PHYSICS) * 1e-3,
+         lp.GetSlidingAvg(FrameProfiler::PROFILE_MISC) * 1e-3, lp.GetSlidingAvg(FrameProfiler::PROFILE_SLEEP) * 1e-3, lp.GetSlidingAvg(FrameProfiler::PROFILE_CUSTOM1) * 1e-3,
+         lp.GetSlidingAvg(FrameProfiler::PROFILE_CUSTOM2) * 1e-3, lp.GetSlidingAvg(FrameProfiler::PROFILE_CUSTOM3) * 1e-3);
+      fprintf(stderr, "PERFPROBE: render frame %.3f | wait %.3f waitSC %.3f submit %.3f flip %.3f sleep %.3f ms\n", rp.GetSlidingAvg(FrameProfiler::PROFILE_FRAME) * 1e-3,
+         rp.GetSlidingAvg(FrameProfiler::PROFILE_RENDER_WAIT) * 1e-3, rp.GetSlidingAvg(FrameProfiler::PROFILE_RENDER_WAIT_SC) * 1e-3, rp.GetSlidingAvg(FrameProfiler::PROFILE_RENDER_SUBMIT) * 1e-3,
+         rp.GetSlidingAvg(FrameProfiler::PROFILE_RENDER_FLIP) * 1e-3, rp.GetSlidingAvg(FrameProfiler::PROFILE_RENDER_SLEEP) * 1e-3);
+   }
+   vector<std::pair<string, ViewAcc>> sorted(views.begin(), views.end());
+   std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second.order < b.second.order; });
+   for (const auto& [name, acc] : sorted)
+      fprintf(stderr, "PERFPROBE:   view gpu %7.3f ms cpu %6.3f ms x%5.2f/frame  %s\n", acc.gpu / f, acc.cpu / f, static_cast<double>(acc.n) / f, name.c_str());
+   fflush(stderr);
+   views.clear();
+   winStart = now; frames = 0; gpuFrame = cpuSubmit = waitSubmit = waitRender = 0.;
+   numDraw = numCompute = numBlit = numViews = 0;
+}
+
 void RenderDevice::RenderThread(RenderDevice* rd, bgfx::Init init)
 {
    SetThreadName("RenderThread"s);
@@ -763,6 +836,8 @@ void RenderDevice::BGFXDesktopRenderLoop(const bgfx::Init& init)
    const bool waitableSwapchain = (bgfx::getCaps()->supported & BGFX_CAPS_WAITABLE_SWAPCHAIN) != 0;
    if (waitableSwapchain)
       bgfx::waitForSwapchain();
+   if (PerfProbePeriod() > 0)
+      bgfx::setDebug(BGFX_DEBUG_PROFILER);
 
 #if BX_PLATFORM_WINDOWS
    // Use highest priority for better timing and lower jitter (as we are doing software pacing)
@@ -1075,6 +1150,7 @@ void RenderDevice::BGFXDesktopRenderLoop(const bgfx::Init& init)
          g_pplayer->m_logicProfiler.OnPresented(lastSyncTimestamp);
 
          // Also collect frame stats as the frame is likely rendered at this point
+         PerfProbeOnFrame(bgfx::getStats());
          if (const bgfx::Stats* const stats = bgfx::getStats(); stats->gpuFrameNum != lastGpuFrameNum)
          {
             m_lastGPUFrameLength = (stats->gpuTimeEnd - stats->gpuTimeBegin) * 1000000ULL / stats->gpuTimerFreq;
