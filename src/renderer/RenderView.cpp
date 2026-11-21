@@ -267,13 +267,33 @@ RenderTarget* RenderView::GetPostProcessRenderTarget2()
    return m_pPostProcessRenderTarget2;
 }
 
+// PROBE (never carried): which SMAA implementation runs, so the three can be compared INSIDE ONE PROCESS on the very same
+// scene state (two launches of the same build do not render identical pixels, so cross-launch screenshots prove nothing).
+//   0 = upstream (scratch target is the previous back buffer, MSAA or not; blend weights shaded on every pixel)
+//   1 = dedicated single sample scratch target
+//   2 = 1 + depth masked blend weight pass (what the build does by default)
+// VPX_PROBE_SMAA_MODE=<n> pins a mode, VPX_PROBE_SMAA_CYCLE=<seconds> cycles 0,1,2 on the wall clock: mode = (epoch / seconds) % 3.
+static int s_probeSMAAMode = 2;
+static void PerfProbeUpdateSMAAMode()
+{
+   static const int cycle = [] { const char* const v = getenv("VPX_PROBE_SMAA_CYCLE"); return v ? atoi(v) : 0; }();
+   static const int pinned = [] { const char* const v = getenv("VPX_PROBE_SMAA_MODE"); return v ? atoi(v) : 2; }();
+   const int mode = cycle > 0 ? static_cast<int>((time(nullptr) / cycle) % 3) : pinned;
+   if (mode != s_probeSMAAMode)
+   {
+      s_probeSMAAMode = mode;
+      fprintf(stderr, "PROBE: SMAA mode -> %d at epoch %lld\n", mode, static_cast<long long>(time(nullptr)));
+      fflush(stderr);
+   }
+}
+
 RenderTarget* RenderView::GetPostProcessRenderTarget3()
 {
    // The previous back buffer is unused during post processing: reuse it, unless supersampled as it must have the post process size
    RenderTarget* pp1 = GetPostProcessRenderTarget1();
    RenderTarget* previous = GetPreviousBackBufferTexture();
    const bool sameSize = previous->GetWidth() == pp1->GetWidth() && previous->GetHeight() == pp1->GetHeight();
-   if (sameSize && !previous->IsMSAA())
+   if (sameSize && (!previous->IsMSAA() || s_probeSMAAMode == 0))
       return previous;
    if (m_pPostProcessRenderTarget3 == nullptr)
    {
@@ -1843,9 +1863,34 @@ RenderTarget* RenderView::ApplyPostProcessedAntialiasing(RenderTarget* renderedR
       rd->m_FBShader->SetVector(
          ShaderUniform::w_h_height, (float)(1.0 / sourceRT->GetWidth()), (float)(1.0 / sourceRT->GetHeight()), (float)sourceRT->GetWidth(), (float)sourceRT->GetHeight());
 
+      PerfProbeUpdateSMAAMode();
+      RenderTarget* outputRT;
+      if (s_probeSMAAMode < 2)
+      { // PROBE: the upstream passes, verbatim
+         outputRT = GetPostProcessRenderTarget3();
+         assert(outputRT != renderedRT);
+         rd->SetRenderTarget("SMAA Color/Edge Detection"s, outputRT, false);
+         rd->AddRenderTargetDependency(sourceRT); // PostProcess RT 1
+         rd->Clear(clearType::TARGET, 0x00000000); // Needed since shader uses discard
+         rd->m_FBShader->SetTechnique(ShaderTechnique::SMAA_ColorEdgeDetection);
+         rd->DrawFullscreenTexturedQuad(rd->m_FBShader);
+         renderedRT = outputRT;
+
+         outputRT = GetPostProcessRenderTarget(sourceRT);
+         assert(outputRT != renderedRT);
+         rd->SetRenderTarget("SMAA Blend weight calculation"s, outputRT, false);
+         rd->AddRenderTargetDependency(sourceRT); // PostProcess RT 1
+         rd->AddRenderTargetDependency(renderedRT); // BackBuffer RT
+         rd->m_FBShader->SetTechnique(ShaderTechnique::SMAA_BlendWeightCalculation);
+         rd->m_FBShader->SetTexture(ShaderUniform::edgesTex, renderedRT->GetColorSampler());
+         rd->DrawFullscreenTexturedQuad(rd->m_FBShader);
+         renderedRT = outputRT;
+      }
+      else
+      {
       // Edge detection: also writes the depth of the pixels it does not discard (the quad is at depth 0, the clear at 1),
       // turning the depth buffer into the edge mask of the next pass (see GetSMAAEdgeRenderTarget)
-      RenderTarget* outputRT = GetSMAAEdgeRenderTarget();
+      outputRT = GetSMAAEdgeRenderTarget();
       assert(outputRT != renderedRT);
       rd->SetRenderTarget("SMAA Color/Edge Detection"s, outputRT, false);
       rd->AddRenderTargetDependency(sourceRT); // PostProcess RT 1
@@ -1873,6 +1918,7 @@ RenderTarget* RenderView::ApplyPostProcessedAntialiasing(RenderTarget* renderedR
       rd->SetRenderState(RenderState::ZENABLE, RenderState::RS_FALSE);
       rd->SetRenderState(RenderState::ZFUNC, RenderState::Z_LESSEQUAL);
       renderedRT = outputRT;
+      } // PROBE
 
       outputRT = outputBackBuffer ? outputBackBuffer : GetPostProcessRenderTarget3();
       assert(outputRT != renderedRT);
