@@ -422,6 +422,9 @@ void PerfProbeNameView(uint16_t viewId, const string& passName, const string& rt
       // "Transmitted Light 1234" style names carry a per-frame counter: drop digits so they aggregate
       std::erase_if(n, [](char c) { return c >= '0' && c <= '9'; });
       g_perfProbeViewNames[viewId] = n + " [RT=" + rtName + "]";
+      // Also hand the name to BGFX (VPX only does this in debug builds): its view stats then carry the
+      // name of the frame they were measured on, which the id table above cannot guarantee
+      bgfx::setViewName(viewId, g_perfProbeViewNames[viewId].c_str());
    }
 }
 
@@ -450,7 +453,7 @@ static void PerfProbeOnFrame(const bgfx::Stats* const stats)
       for (uint16_t i = 0; i < stats->numViews; i++)
       {
          const bgfx::ViewStats& vs = stats->viewStats[i];
-         ViewAcc& acc = views[vs.view < 256 && !g_perfProbeViewNames[vs.view].empty() ? g_perfProbeViewNames[vs.view] : std::format("view#{}", vs.view)];
+         ViewAcc& acc = views[vs.name[0] != 0 ? string(vs.name) : std::format("view#{}", vs.view)];
          if (acc.n == 0)
             acc.order = static_cast<uint32_t>(views.size());
          acc.gpu += static_cast<double>(vs.gpuTimeEnd - vs.gpuTimeBegin) * 1000. / static_cast<double>(stats->gpuTimerFreq);
