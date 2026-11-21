@@ -409,6 +409,22 @@ static int PerfProbePeriod()
    return period;
 }
 
+// BGFX only keeps view names in debug builds, so the probe keeps its own id -> name table,
+// filled as each pass is executed. Ids are handed out in pass order every frame, so in a
+// steady scene an id means the same pass from one frame to the next (GPU times arrive a
+// few frames late).
+static string g_perfProbeViewNames[256];
+void PerfProbeNameView(uint16_t viewId, const string& passName, const string& rtName)
+{
+   if (PerfProbePeriod() > 0 && viewId < 256)
+   {
+      string n = passName;
+      // "Transmitted Light 1234" style names carry a per-frame counter: drop digits so they aggregate
+      std::erase_if(n, [](char c) { return c >= '0' && c <= '9'; });
+      g_perfProbeViewNames[viewId] = n + " [RT=" + rtName + "]";
+   }
+}
+
 static void PerfProbeOnFrame(const bgfx::Stats* const stats)
 {
    if (PerfProbePeriod() <= 0 || stats == nullptr)
@@ -434,7 +450,7 @@ static void PerfProbeOnFrame(const bgfx::Stats* const stats)
       for (uint16_t i = 0; i < stats->numViews; i++)
       {
          const bgfx::ViewStats& vs = stats->viewStats[i];
-         ViewAcc& acc = views[vs.name];
+         ViewAcc& acc = views[vs.view < 256 && !g_perfProbeViewNames[vs.view].empty() ? g_perfProbeViewNames[vs.view] : std::format("view#{}", vs.view)];
          if (acc.n == 0)
             acc.order = static_cast<uint32_t>(views.size());
          acc.gpu += static_cast<double>(vs.gpuTimeEnd - vs.gpuTimeBegin) * 1000. / static_cast<double>(stats->gpuTimerFreq);

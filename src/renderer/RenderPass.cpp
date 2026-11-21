@@ -5,6 +5,8 @@
 #include "RenderCommand.h"
 #include "RenderDevice.h"
 
+void PerfProbeNameView(uint16_t viewId, const string& passName, const string& rtName); // PROBE build only, see RenderDevice.cpp
+
 RenderPass::RenderPass(const string& name, RenderTarget* const rt)
    : m_rt(rt)
    , m_name(name)
@@ -259,6 +261,7 @@ bool RenderPass::Execute(const bool log)
    {
       m_rt->Activate();
       #if defined(ENABLE_BGFX)
+      PerfProbeNameView(m_rt->GetRenderDevice()->m_activeViewId, m_name, m_rt->m_name);
       #if defined(_DEBUG)
       bgfx::setViewName(m_rt->GetRenderDevice()->m_activeViewId, m_name.append(" [RT=").append(m_rt->m_name).append(1,']').c_str());
       #endif
@@ -271,6 +274,7 @@ bool RenderPass::Execute(const bool log)
       assert(m_singleLayerRendering < m_rt->m_nLayers);
       m_rt->Activate(m_singleLayerRendering);
       #if defined(ENABLE_BGFX)
+      PerfProbeNameView(m_rt->GetRenderDevice()->m_activeViewId, m_name, m_rt->m_name);
       #if defined(_DEBUG)
       bgfx::setViewName(m_rt->GetRenderDevice()->m_activeViewId, m_name.append(" [RT=").append(m_rt->m_name).append(" / Layer=").append(std::to_string(m_singleLayerRendering)).append(1,']').c_str());
       #endif
@@ -284,6 +288,7 @@ bool RenderPass::Execute(const bool log)
       {
          m_rt->Activate(layer);
          #if defined(ENABLE_BGFX)
+         PerfProbeNameView(m_rt->GetRenderDevice()->m_activeViewId, m_name, m_rt->m_name);
          #if defined(_DEBUG)
          bgfx::setViewName(m_rt->GetRenderDevice()->m_activeViewId, m_name.append(" [RT=").append(m_rt->m_name).append(" / Layer=").append(std::to_string(layer)).append(1,']').c_str());
          #endif
