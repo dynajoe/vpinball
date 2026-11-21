@@ -89,6 +89,10 @@ void RenderView::ReleaseTargets()
    m_pPostProcessRenderTarget2 = nullptr;
    delete m_pPostProcessRenderTarget3;
    m_pPostProcessRenderTarget3 = nullptr;
+   delete m_pSMAAWeightRenderTarget; // Before the edge target, whose depth buffer it shares
+   m_pSMAAWeightRenderTarget = nullptr;
+   delete m_pSMAAEdgeRenderTarget;
+   m_pSMAAEdgeRenderTarget = nullptr;
    delete m_pReflectionBufferTexture;
    m_pReflectionBufferTexture = nullptr;
    delete m_pMotionBlurBufferTexture;
@@ -188,8 +192,8 @@ void RenderView::ResizeRenderTargets()
 
    // Frames already submitted may still reference the previous targets: release them at the end of the frame being prepared
    vector<RenderTarget*> released { m_pOffscreenBackBufferTexture1, m_pOffscreenBackBufferTexture2, m_pOffscreenMSAABackBufferTexture, m_pBloomBufferTexture, m_pBloomTmpBufferTexture,
-      m_pPostProcessRenderTarget1, m_pPostProcessRenderTarget2, m_pPostProcessRenderTarget3, m_pReflectionBufferTexture, m_pMotionBlurBufferTexture, m_pAORenderTarget1, m_pAORenderTarget2,
-      m_staticPrepassRT };
+      m_pPostProcessRenderTarget1, m_pPostProcessRenderTarget2, m_pPostProcessRenderTarget3, m_pSMAAWeightRenderTarget, m_pSMAAEdgeRenderTarget, m_pReflectionBufferTexture,
+      m_pMotionBlurBufferTexture, m_pAORenderTarget1, m_pAORenderTarget2, m_staticPrepassRT };
    std::erase(released, nullptr);
    rd->AddEndOfFrameCmd(
       [released]()
@@ -215,6 +219,8 @@ void RenderView::ResizeRenderTargets()
    m_pPostProcessRenderTarget1 = nullptr;
    m_pPostProcessRenderTarget2 = nullptr;
    m_pPostProcessRenderTarget3 = nullptr;
+   m_pSMAAWeightRenderTarget = nullptr;
+   m_pSMAAEdgeRenderTarget = nullptr;
    m_pReflectionBufferTexture = nullptr;
    m_pMotionBlurBufferTexture = nullptr;
    m_pAORenderTarget1 = nullptr;
@@ -275,9 +281,9 @@ RenderTarget* RenderView::GetPostProcessRenderTarget3()
       {
          // ... and unless it is multisampled. Under BGFX the back buffers are the MSAA targets themselves (BGFX resolves them
          // when they are unbound), so using one as a postprocess scratch buffer rasterizes each fullscreen pass at every sample
-         // and resolves the whole target (color and depth) afterward: with 4x MSAA at 4K the 2 SMAA passes landing here cost
-         // more than the rest of SMAA together. A dedicated single sample target with the same color format holds exactly the
-         // same texels (a fullscreen pass writes the same value to all the samples of a pixel, so resolving returned it unchanged)
+         // and resolves the whole target (color and depth) afterward: with 4x MSAA at 4K the SMAA output landing here costs
+         // several times what it does on a plain target. A dedicated single sample target with the same color format holds exactly
+         // the same texels (a fullscreen pass writes the same value to all the samples of a pixel, so resolving returned it unchanged)
          m_pPostProcessRenderTarget3 = new RenderTarget(m_renderer->m_renderDevice, previous->m_type, "PostProcess3"s, previous->GetWidth(), previous->GetHeight(),
             previous->GetColorFormat(), false, 1, "Fatal Error: unable to create post-processing AA buffer!");
       }
@@ -285,6 +291,34 @@ RenderTarget* RenderView::GetPostProcessRenderTarget3()
          m_pPostProcessRenderTarget3 = pp1->Duplicate("PostProcess3"s);
    }
    return m_pPostProcessRenderTarget3;
+}
+
+// SMAA only has work to do on the pixels where its first pass found an edge, a few percent of a frame. The edge pass
+// discards the other pixels, so by letting it write depth, the depth buffer of its target ends up being a mask of the edge
+// pixels: the blend weight pass, by far the most expensive of the three, is then depth tested against it and only shades
+// these (this is the stencil masking of the reference implementation, done with the depth buffer since the render states
+// do not expose the stencil). The masked out pixels keep the cleared value, which is what the shader outputs for them.
+RenderTarget* RenderView::GetSMAAEdgeRenderTarget()
+{
+   if (m_pSMAAEdgeRenderTarget == nullptr)
+   {
+      // Edges are 0 or 1: the 8 bit postprocess format holds them exactly
+      const RenderTarget* const pp1 = GetPostProcessRenderTarget1();
+      m_pSMAAEdgeRenderTarget = new RenderTarget(m_renderer->m_renderDevice, pp1->m_type, "SMAAEdges"s, pp1->GetWidth(), pp1->GetHeight(), pp1->GetColorFormat(), true, 1,
+         "Fatal Error: unable to create SMAA edge buffer!");
+   }
+   return m_pSMAAEdgeRenderTarget;
+}
+
+RenderTarget* RenderView::GetSMAAWeightRenderTarget()
+{
+   if (m_pSMAAWeightRenderTarget == nullptr)
+   {
+      RenderTarget* const edges = GetSMAAEdgeRenderTarget();
+      m_pSMAAWeightRenderTarget = new RenderTarget(m_renderer->m_renderDevice, edges->m_type, "SMAAWeights"s, edges->GetWidth(), edges->GetHeight(), edges->GetColorFormat(), true, 1,
+         "Fatal Error: unable to create SMAA blend weight buffer!", edges);
+   }
+   return m_pSMAAWeightRenderTarget;
 }
 
 RenderTarget* RenderView::GetPostProcessRenderTarget(RenderTarget* renderedRT)
@@ -1806,23 +1840,35 @@ RenderTarget* RenderView::ApplyPostProcessedAntialiasing(RenderTarget* renderedR
       rd->m_FBShader->SetVector(
          ShaderUniform::w_h_height, (float)(1.0 / sourceRT->GetWidth()), (float)(1.0 / sourceRT->GetHeight()), (float)sourceRT->GetWidth(), (float)sourceRT->GetHeight());
 
-      RenderTarget* outputRT = GetPostProcessRenderTarget3();
+      // Edge detection: also writes the depth of the pixels it does not discard (the quad is at depth 0, the clear at 1),
+      // turning the depth buffer into the edge mask of the next pass (see GetSMAAEdgeRenderTarget)
+      RenderTarget* outputRT = GetSMAAEdgeRenderTarget();
       assert(outputRT != renderedRT);
       rd->SetRenderTarget("SMAA Color/Edge Detection"s, outputRT, false);
       rd->AddRenderTargetDependency(sourceRT); // PostProcess RT 1
-      rd->Clear(clearType::TARGET, 0x00000000); // Needed since shader uses discard
+      rd->Clear(clearType::TARGET | clearType::ZBUFFER, 0x00000000); // Needed since shader uses discard
+      rd->SetRenderState(RenderState::ZENABLE, RenderState::RS_TRUE);
+      rd->SetRenderState(RenderState::ZFUNC, RenderState::Z_ALWAYS);
+      rd->SetRenderState(RenderState::ZWRITEENABLE, RenderState::RS_TRUE);
       rd->m_FBShader->SetTechnique(ShaderTechnique::SMAA_ColorEdgeDetection);
       rd->DrawFullscreenTexturedQuad(rd->m_FBShader);
       renderedRT = outputRT;
 
-      outputRT = GetPostProcessRenderTarget(sourceRT);
+      // Blend weights: only shaded where the depth buffer (shared with the edge target) holds an edge. The other pixels keep
+      // the cleared value, which is exactly what the shader outputs for a pixel without edge
+      outputRT = GetSMAAWeightRenderTarget();
       assert(outputRT != renderedRT);
       rd->SetRenderTarget("SMAA Blend weight calculation"s, outputRT, false);
       rd->AddRenderTargetDependency(sourceRT); // PostProcess RT 1
-      rd->AddRenderTargetDependency(renderedRT); // BackBuffer RT
+      rd->AddRenderTargetDependency(renderedRT); // SMAA edges (and the edge mask in the shared depth buffer)
+      rd->Clear(clearType::TARGET, 0x00000000);
+      rd->SetRenderState(RenderState::ZFUNC, RenderState::Z_GREATEREQUAL);
+      rd->SetRenderState(RenderState::ZWRITEENABLE, RenderState::RS_FALSE);
       rd->m_FBShader->SetTechnique(ShaderTechnique::SMAA_BlendWeightCalculation);
       rd->m_FBShader->SetTexture(ShaderUniform::edgesTex, renderedRT->GetColorSampler());
       rd->DrawFullscreenTexturedQuad(rd->m_FBShader);
+      rd->SetRenderState(RenderState::ZENABLE, RenderState::RS_FALSE);
+      rd->SetRenderState(RenderState::ZFUNC, RenderState::Z_LESSEQUAL);
       renderedRT = outputRT;
 
       outputRT = outputBackBuffer ? outputBackBuffer : GetPostProcessRenderTarget3();
