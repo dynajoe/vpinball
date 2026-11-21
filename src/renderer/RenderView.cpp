@@ -266,10 +266,24 @@ RenderTarget* RenderView::GetPostProcessRenderTarget3()
    // The previous back buffer is unused during post processing: reuse it, unless supersampled as it must have the post process size
    RenderTarget* pp1 = GetPostProcessRenderTarget1();
    RenderTarget* previous = GetPreviousBackBufferTexture();
-   if (previous->GetWidth() == pp1->GetWidth() && previous->GetHeight() == pp1->GetHeight())
+   const bool sameSize = previous->GetWidth() == pp1->GetWidth() && previous->GetHeight() == pp1->GetHeight();
+   if (sameSize && !previous->IsMSAA())
       return previous;
    if (m_pPostProcessRenderTarget3 == nullptr)
-      m_pPostProcessRenderTarget3 = pp1->Duplicate("PostProcess3"s);
+   {
+      if (sameSize)
+      {
+         // ... and unless it is multisampled. Under BGFX the back buffers are the MSAA targets themselves (BGFX resolves them
+         // when they are unbound), so using one as a postprocess scratch buffer rasterizes each fullscreen pass at every sample
+         // and resolves the whole target (color and depth) afterward: with 4x MSAA at 4K the 2 SMAA passes landing here cost
+         // more than the rest of SMAA together. A dedicated single sample target with the same color format holds exactly the
+         // same texels (a fullscreen pass writes the same value to all the samples of a pixel, so resolving returned it unchanged)
+         m_pPostProcessRenderTarget3 = new RenderTarget(m_renderer->m_renderDevice, previous->m_type, "PostProcess3"s, previous->GetWidth(), previous->GetHeight(),
+            previous->GetColorFormat(), false, 1, "Fatal Error: unable to create post-processing AA buffer!");
+      }
+      else
+         m_pPostProcessRenderTarget3 = pp1->Duplicate("PostProcess3"s);
+   }
    return m_pPostProcessRenderTarget3;
 }
 
