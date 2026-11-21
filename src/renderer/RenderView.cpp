@@ -1301,7 +1301,10 @@ void RenderView::SetupTonemapping(RenderTarget* renderedRT, RenderTarget* tonema
    RenderDevice* const rd = r->m_renderDevice;
    //const unsigned int jittertime = (unsigned int)((uint64_t)msec()*90/1000);
    //const float jitter = (float)((msec() & 2047) / 1000.0);
-   const float jitter = (float)(radical_inverse(g_pplayer->m_overall_frames % 2048) / 1000.0); // Deterministic jitter to ensure stable render for regression tests
+   // PROBE: VPX_PROBE_FREEZE=1 pins the dither pattern (and the AO jitter below) to frame 0, so a static scene renders
+   // the exact same pixels every frame and screenshots of two builds can be compared bit for bit. Dithering itself stays on.
+   static const bool probeFreeze = getenv("VPX_PROBE_FREEZE") != nullptr;
+   const float jitter = probeFreeze ? 0.f : (float)(radical_inverse(g_pplayer->m_overall_frames % 2048) / 1000.0); // Deterministic jitter to ensure stable render for regression tests
    const bool useAO = r->GetAOMode() == 2;
 
    // switch to output buffer (main output frame buffer, or a temporary one for postprocessing)
@@ -2224,7 +2227,7 @@ void RenderView::Render()
 
    // Compute AO contribution (to be applied later, with tonemapping)
    if (r->GetAOMode() == 2) // Only process for dynamic AO
-      UpdateAmbientOcclusion(GetBackBufferTexture(), g_pplayer->m_overall_frames % 2048);
+      UpdateAmbientOcclusion(GetBackBufferTexture(), getenv("VPX_PROBE_FREEZE") != nullptr ? 0 : g_pplayer->m_overall_frames % 2048);
 
    // Compute bloom (to be applied later, with tonemapping)
    UpdateBloom(renderedRT);
