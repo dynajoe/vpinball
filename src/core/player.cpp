@@ -2691,6 +2691,40 @@ void Player::PrepareFrame()
    UpdateGameLogic();
    #endif
 
+   // PROBE (never carried): VPX_PROBE_BALLPACE=1. A ball looks smooth when every displayed frame shows it one frame time
+   // further along. What a frame shows is the physics state sampled here, so log how much PHYSICS time passed between two
+   // consecutive prepared frames (and how much wall time between the two samplings): uneven steps = uneven ball motion,
+   // even at a perfect frame rate.
+   {
+      static const bool on = getenv("VPX_PROBE_BALLPACE") != nullptr;
+      if (on && m_physics->IsStarted())
+      {
+         static uint64_t lastPhys = 0, lastWall = 0, winStart = 0;
+         static double sP = 0., sP2 = 0., sW = 0., sW2 = 0., mnP = 1e9, mxP = 0., mnW = 1e9, mxW = 0.;
+         static int n = 0, hist[8] = {};
+         const uint64_t phys = m_physics->GetCurrentTime(), wall = usec();
+         if (lastPhys != 0)
+         {
+            const double dp = (phys - lastPhys) * 1e-3, dw = (wall - lastWall) * 1e-3;
+            sP += dp; sP2 += dp * dp; sW += dw; sW2 += dw * dw; n++;
+            mnP = min(mnP, dp); mxP = max(mxP, dp); mnW = min(mnW, dw); mxW = max(mxW, dw);
+            const int b = dp < 6. ? 0 : dp < 7.5 ? 1 : dp < 8.5 ? 2 : dp < 9.5 ? 3 : dp < 11. ? 4 : dp < 14. ? 5 : dp < 20. ? 6 : 7;
+            hist[b]++;
+         }
+         lastPhys = phys; lastWall = wall;
+         if (winStart == 0) winStart = wall;
+         if (wall - winStart >= 5000000 && n > 1)
+         {
+            const double mP = sP / n, mW = sW / n;
+            fprintf(stderr, "BALLPACE: %d frames | physics step per frame mean %.3f sd %.3f min %.2f max %.2f ms | sample wall interval mean %.3f sd %.3f min %.2f max %.2f ms | step hist <6:%d 6-7.5:%d 7.5-8.5:%d 8.5-9.5:%d 9.5-11:%d 11-14:%d 14-20:%d >20:%d\n",
+               n, mP, sqrt(max(0., sP2 / n - mP * mP)), mnP, mxP, mW, sqrt(max(0., sW2 / n - mW * mW)), mnW, mxW, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
+            fflush(stderr);
+            winStart = wall; n = 0; sP = sP2 = sW = sW2 = 0.; mnP = mnW = 1e9; mxP = mxW = 0.;
+            for (int& h : hist) h = 0;
+         }
+      }
+   }
+
    #ifdef MSVC_CONCURRENCY_VIEWER
    delete tagSpan;
    #endif
